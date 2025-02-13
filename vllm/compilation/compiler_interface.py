@@ -16,11 +16,15 @@ from vllm.config import VllmConfig
 class CompilerRegistry:
     registered_adaptors = {}
 
+
 def register_adaptor(compiler_cls_name: str):
+
     def decorator(compiler_cls: Type[CompilerInterface]):
         CompilerRegistry.registered_adaptors[compiler_cls_name] = compiler_cls
         return compiler_cls
+
     return decorator
+
 
 class CompilerInterface:
     """
@@ -129,6 +133,7 @@ class AlwaysHitShapeEnv:
 
     def produce_guards_expression(self, *args, **kwargs):
         return ""
+
 
 @register_adaptor("inductor")
 class InductorAdaptor(CompilerInterface):
@@ -333,6 +338,7 @@ class InductorAdaptor(CompilerInterface):
 
         return compiled_graph
 
+
 @register_adaptor("eager")
 class EagerAdaptor(CompilerInterface):
     name = "eager"
@@ -347,6 +353,7 @@ class EagerAdaptor(CompilerInterface):
         # we don't need to compile the graph, just return the graph itself.
         # It does not support caching, return None for the handle.
         return graph, None
+
 
 @register_adaptor("hidet")
 class HidetAdaptor(CompilerInterface):
