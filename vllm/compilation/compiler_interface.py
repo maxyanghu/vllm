@@ -369,8 +369,14 @@ class HidetAdaptor(CompilerInterface):
 
         graph = copy.deepcopy(graph)
         import hidet
-        hidet.option.parallel_build(False)
+        hidet.option.parallel_build(True)
         from hidet.graph.frontend.torch import dynamo_backends
         compiler_config['mode'] = 'max-autotune-no-cudagraphs'
         return dynamo_backends.hidet_backend(graph, example_inputs,
                                              **compiler_config), None
+
+    def initialize_cache(self, cache_dir: str, disable_cache: bool = False):
+        if disable_cache:
+            return
+        hidet_cache = os.path.join(cache_dir, "hidet_cache")
+        os.makedirs(hidet_cache, exist_ok=True)
