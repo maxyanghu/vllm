@@ -17,7 +17,13 @@ from vllm.config import CompilationConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils import weak_ref_tensors
 
-from .compiler_interface import EagerAdaptor, InductorAdaptor
+# why is this high risk change? We remove the import of EagerAdaptor and
+# InductorAdaptor and replace it with CompilerRegistry. Upstream code is
+# changing fast and there maybe new changes to the Interface. We may
+# need to adapt to the change for next merge.
+# DMWL_CHANGE_HIGH_RISK_BEGIN
+from .compiler_interface import CompilerRegistry
+# DMWL_CHANGE_HIGH_RISK_END
 from .counter import compilation_counter
 from .inductor_pass import InductorPass
 from .monitor import end_monitoring_torch_compile
@@ -41,9 +47,23 @@ class CompilerManager:
     support int as key.
     """
 
-    def __init__(self, use_inductor: bool):
+    # why is this high risk change? We remove the import of EagerAdaptor and
+    # InductorAdaptor and replace it with CompilerRegistry. Upstream code is
+    # changing fast and there maybe new changes to the Interface. We may
+    # need to adapt to the change for next merge.
+    # DMWL_CHANGE_HIGH_RISK_BEGIN
+    def __init__(self, use_inductor: bool, backend: str = ""):
         self.cache: Dict[Tuple[Optional[int], int, str], Any] = dict()
-        cls = InductorAdaptor if use_inductor else EagerAdaptor
+        if use_inductor:
+            cls = CompilerRegistry.registered_adaptors.get("inductor")
+        else:
+            if backend == "":
+                backend = "eager"
+                logger.info("No backend assigned, using eager mode")
+            cls = CompilerRegistry.registered_adaptors.get(backend)
+        assert cls is not None,\
+            f"Backend {backend} is not registered in the CompilerRegistry"
+        # DMWL_CHANGE_HIGH_RISK_END
         self.compiler = cls()
 
     def compute_hash(self, vllm_config: VllmConfig) -> str:
@@ -115,12 +135,18 @@ class CompilerManager:
                 logger.info("Directly load the compiled graph for shape %s "
                             "from the cache", str(runtime_shape))  # noqa
             return compiled_graph
+        # DMWL_CHANGE_LOW_RISK_BEGIN
+        if compilation_config.use_inductor:
+            compiler_manager_compilation_config = additional_inductor_config
+        else:
+            compiler_manager_compilation_config = compilation_config.dict()
 
         # no compiler cached the graph, or the cache is disabled,
         # we need to compile it
         compiled_graph, handle = self.compiler.compile(
-            graph, example_inputs, additional_inductor_config, runtime_shape)
-
+            graph, example_inputs, compiler_manager_compilation_config,
+            runtime_shape)
+        # DMWL_CHANGE_LOW_RISK_END
         assert compiled_graph is not None, "Failed to compile the graph"
 
         # store the artifact in the cache
@@ -326,12 +352,15 @@ class VllmBackend:
 
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
-
+        # DMWL_CHANGE_LOW_RISK_BEGIN
         self.compiler_manager: CompilerManager = CompilerManager(
-            self.compilation_config.use_inductor)
+            use_inductor=self.compilation_config.use_inductor,
+            backend=self.compilation_config.backend)
 
-        # `torch.compile` is JIT compiled, so we don't need to
-        # do anything here
+
+# DMWL_CHANGE_LOW_RISK_END
+# `torch.compile` is JIT compiled, so we don't need to
+# do anything here
 
     def configure_post_pass(self):
         config = self.compilation_config

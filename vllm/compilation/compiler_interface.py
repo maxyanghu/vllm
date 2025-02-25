@@ -3,7 +3,9 @@ import copy
 import hashlib
 import os
 from contextlib import ExitStack
-from typing import Any, Callable, Dict, List, Optional, Tuple
+# DMWL_CHANGE_LOW_RISK_BEGIN
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
+# DMWL_CHANGE_LOW_RISK_END
 from unittest.mock import patch
 
 import torch
@@ -84,6 +86,23 @@ class CompilerInterface:
         raise NotImplementedError("caching is not supported")
 
 
+# DMWL_CHANGE_LOW_RISK_BEGIN
+class CompilerRegistry:
+    registered_adaptors: Dict[str, Type[CompilerInterface]] = {}
+
+
+def register_adaptor(compiler_cls_name: str):
+
+    def decorator(compiler_cls: Type[CompilerInterface]):
+        CompilerRegistry.registered_adaptors[compiler_cls_name] = compiler_cls
+        return compiler_cls
+
+    return decorator
+
+
+# DMWL_CHANGE_LOW_RISK_END
+
+
 class AlwaysHitShapeEnv:
     """
     Why do we need this class:
@@ -122,6 +141,9 @@ class AlwaysHitShapeEnv:
         return ""
 
 
+# DMWL_CHANGE_LOW_RISK_BEGIN
+@register_adaptor("inductor")
+# DMWL_CHANGE_LOW_RISK_END
 class InductorAdaptor(CompilerInterface):
     """
     The adaptor for the Inductor compiler, version 2.5 and 2.6.
@@ -325,6 +347,9 @@ class InductorAdaptor(CompilerInterface):
         return compiled_graph
 
 
+# DMWL_CHANGE_LOW_RISK_BEGIN
+@register_adaptor("eager")
+# DMWL_CHANGE_LOW_RISK_END
 class EagerAdaptor(CompilerInterface):
     name = "eager"
 
@@ -338,3 +363,33 @@ class EagerAdaptor(CompilerInterface):
         # we don't need to compile the graph, just return the graph itself.
         # It does not support caching, return None for the handle.
         return graph, None
+
+
+# DMWL_CHANGE_LOW_RISK_BEGIN
+@register_adaptor("hidet")
+class HidetAdaptor(CompilerInterface):
+    name = "hidet"
+
+    def compile(
+        self,
+        graph: fx.GraphModule,
+        example_inputs: List[Any],
+        compiler_config: Dict[str, Any],
+        runtime_shape: Optional[int] = None
+    ) -> Tuple[Optional[Callable], Optional[Any]]:
+        graph = copy.deepcopy(graph)
+        from hidet.graph.frontend.torch import dynamo_backends
+        hidet_compiler_config = compiler_config.get("hidet_config") or {
+            "mode": "max-autotune-no-cudagraphs"
+        }
+        return dynamo_backends.hidet_backend(graph, example_inputs,
+                                             **hidet_compiler_config), None
+
+    def initialize_cache(self, cache_dir: str, disable_cache: bool = False):
+        if disable_cache:
+            return
+        hidet_cache = os.path.join(cache_dir, "hidet_cache")
+        os.makedirs(hidet_cache, exist_ok=True)
+
+
+# DMWL_CHANGE_LOW_RISK_END

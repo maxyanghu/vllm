@@ -2964,7 +2964,9 @@ class CompilationConfig(BaseModel):
     backend: str = ""
     custom_ops: List[str] = Field(default_factory=list)
     splitting_ops: List[str] = Field(default=None)  # type: ignore
-
+    # DMWL_CHANGE_MED_RISK_BEGIN
+    hidet_config: Optional[Dict] = None
+    # DMWL_CHANGE_MED_RISK_END
     use_inductor: bool = True
     compile_sizes: Optional[List[Union[int, str]]] = Field(default=None)
     inductor_compile_config: Dict = Field(default_factory=dict)
