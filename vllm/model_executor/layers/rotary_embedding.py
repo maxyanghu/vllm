@@ -828,7 +828,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         cache = torch.cat((cos, sin), dim=-1)
         return cache
 
-    def forward(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -869,6 +869,15 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             query = query_rot
             key = key_rot
         return query, key
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.forward_native(positions, query, key, offsets)
 
 
 class Llama3RotaryEmbedding(RotaryEmbedding):
@@ -961,7 +970,7 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
             torch.stack([torch.cos(freqs), torch.sin(freqs)], dim=-1))
         return cache
 
-    def forward(
+    def forward_native(
         self,
         query: torch.Tensor,
         key: Optional[torch.Tensor] = None,
@@ -980,6 +989,13 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
         query_out = torch.view_as_real(query_ * freqs_ci).flatten(3)
         key_out = torch.view_as_real(key_ * freqs_ci).flatten(3)
         return query_out.type_as(query), key_out.type_as(key)
+
+    def forward_cuda(
+        self,
+        query: torch.Tensor,
+        key: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.forward_native(query, key)
 
 
 class MRotaryEmbedding(RotaryEmbedding):
@@ -1676,7 +1692,7 @@ class DualChunkRotaryEmbedding(CustomOp):
                                              device=self.device)
         return q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache
 
-    def forward(
+    def forward_native(
         self,
         positions: torch.Tensor,
         query: torch.Tensor,
@@ -1725,6 +1741,15 @@ class DualChunkRotaryEmbedding(CustomOp):
         ),
                           dim=-1)
         return query, key
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_native(positions, query, key, offsets=offsets)
 
     def _apply_rotary_embedding(self, cos_sin, hidden_rot, hidden_pass):
         cos, sin = cos_sin.chunk(2, dim=-1)
