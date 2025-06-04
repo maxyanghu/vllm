@@ -759,7 +759,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
-class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
+class DeepseekScalingRotaryEmbedding(CustomOp, RotaryEmbedding):
     """RotaryEmbedding extended with YaRN method.
 
     Credits to Peng et al. github.com/jquesnelle/yarn
@@ -926,7 +926,7 @@ class Llama3RotaryEmbedding(RotaryEmbedding):
         return new_freqs
 
 
-class Llama4VisionRotaryEmbedding(RotaryEmbedding):
+class Llama4VisionRotaryEmbedding(CustomOp, RotaryEmbedding):
 
     def __init__(
         self,
@@ -998,7 +998,7 @@ class Llama4VisionRotaryEmbedding(RotaryEmbedding):
         return self.forward_native(query, key)
 
 
-class MRotaryEmbedding(RotaryEmbedding):
+class MRotaryEmbedding(CustomOp, RotaryEmbedding):
     """Rotary Embedding with Multimodal Sections."""
 
     def __init__(
