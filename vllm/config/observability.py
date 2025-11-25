@@ -47,6 +47,9 @@ class ObservabilityConfig:
     Note that collecting detailed timing information for each request can be
     expensive."""
 
+    enable_layerwise_nvtx_tracing: bool = False
+    """Enable layerwise NVTX tracing."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
