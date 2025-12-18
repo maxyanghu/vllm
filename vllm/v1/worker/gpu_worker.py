@@ -439,7 +439,10 @@ class Worker(WorkerBase):
             # add the end of the range to ensure compilation/warmup.
             all_sizes = set(cg_capture_sizes)
             all_sizes.update([x for x in warmup_sizes if isinstance(x, int)])
+            INT_MAX = 2**63 - 1
             for compile_range in compile_ranges:
+                if compile_range.end == INT_MAX:
+                    continue
                 if not any(x in compile_range for x in all_sizes):
                     warmup_sizes.append(compile_range.end)
 

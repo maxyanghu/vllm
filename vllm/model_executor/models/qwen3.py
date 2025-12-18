@@ -144,10 +144,10 @@ class Qwen3Attention(nn.Module):
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
+        q = q_by_head.flatten(-2)
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
+        k = k_by_head.flatten(-2)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)

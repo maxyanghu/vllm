@@ -141,6 +141,7 @@ class PiecewiseBackend:
                 if not range_entry.compile_range.is_single_size()
                 else args
             )
+
             range_entry.runnable = self.vllm_backend.compiler_manager.compile(
                 self.graph,
                 args,
@@ -169,9 +170,9 @@ class PiecewiseBackend:
         runtime_shape = args[self.sym_shape_indices[0]]
         range_entry = self._find_range_for_shape(runtime_shape)
 
-        assert range_entry is not None, (
-            f"Shape: {runtime_shape} out of considered ranges: {self.compile_ranges}"
-        )
-
+        # assert range_entry is not None, (
+        #     f"Shape out of considered range: {runtime_shape} "
+        #     "[1, max_num_batched_tokens]"
+        # )
         self._maybe_compile_for_range_entry(range_entry, args)
         return range_entry.runnable(*args)

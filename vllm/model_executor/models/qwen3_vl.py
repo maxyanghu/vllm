@@ -53,6 +53,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import MultiModalConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, VideoDummyOptions
 from vllm.distributed import get_pp_group
+from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import _ACTIVATION_REGISTRY
 from vllm.model_executor.layers.conv import Conv3dLayer
@@ -66,6 +67,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
+from vllm.model_executor.models.vision import should_torch_compile_mm_vit
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
@@ -203,6 +205,17 @@ class Qwen3_VisionMLP(nn.Module):
         return mlp_output
 
 
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+        "cu_seqlens": 0,
+        "rotary_pos_emb_cos": 0,
+        "rotary_pos_emb_sin": 0,
+        "max_seqlen": 0,
+    },
+    mark_unbacked_dims={"max_seqlen": 0},
+    enable_if=should_torch_compile_mm_vit,
+)
 class Qwen3_VisionBlock(nn.Module):
     def __init__(
         self,
@@ -1269,6 +1282,7 @@ class Qwen3VLForConditionalGeneration(
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
 
+        self.vllm_config = vllm_config
         self.config = config
         self.multimodal_config = multimodal_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
@@ -1283,7 +1297,7 @@ class Qwen3VLForConditionalGeneration(
             self.visual = None
         else:
             self.visual = Qwen3_VisionTransformer(
-                config.vision_config,
+                vision_config=config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=quant_config,
                 multimodal_config=multimodal_config,
@@ -1420,12 +1434,16 @@ class Qwen3VLForConditionalGeneration(
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"].type(self.visual.dtype)
-            if self.use_data_parallel:
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual, pixel_values, grid_thw.tolist(), rope_type="rope_3d"
-                )
-            else:
-                image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
+            with set_forward_context(None, self.vllm_config):
+                if self.use_data_parallel:
+                    return run_dp_sharded_mrope_vision_model(
+                        self.visual,
+                        pixel_values,
+                        grid_thw.tolist(),
+                        rope_type="rope_3d",
+                    )
+                else:
+                    image_embeds = self.visual(pixel_values, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
@@ -1444,13 +1462,16 @@ class Qwen3VLForConditionalGeneration(
             pixel_values_videos = video_input["pixel_values_videos"].type(
                 self.visual.dtype
             )
-            if self.use_data_parallel:
-                grid_thw_list = grid_thw.tolist()
-                return run_dp_sharded_mrope_vision_model(
-                    self.visual, pixel_values_videos, grid_thw_list, rope_type="rope_3d"
-                )
-            else:
-                video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
+            with set_forward_context(None, self.vllm_config):
+                if self.use_data_parallel:
+                    return run_dp_sharded_mrope_vision_model(
+                        self.visual,
+                        pixel_values_videos,
+                        grid_thw.tolist(),
+                        rope_type="rope_3d",
+                    )
+                else:
+                    video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw)
 
         # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size

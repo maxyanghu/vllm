@@ -1260,6 +1260,10 @@ class VllmConfig:
                     and x > 1
                 ):
                     computed_compile_ranges_split_points.append(x)
+
+        INT_MAX = 2**63 - 1
+        computed_compile_ranges_split_points.append(INT_MAX)
+
         compilation_config.compile_ranges_split_points = sorted(
             computed_compile_ranges_split_points
         )
