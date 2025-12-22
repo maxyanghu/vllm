@@ -368,6 +368,28 @@ class EngineCore:
         )
         self.iteration_index += 1
 
+    @contextmanager
+    def log_iteration_details(self, scheduler_output: SchedulerOutput):
+        if not VLLM_LOG_ITERATION_DETAILS:
+            yield
+            return
+        iteration_details = compute_iteration_details(scheduler_output)
+        before = time.monotonic()
+        yield
+        logger.info(
+            "Iteration details: "
+            "%d context requests, "
+            "%d context tokens, "
+            "%d generation requests, "
+            "%d generation tokens, "
+            "iteration elapsed time: %.2f ms",
+            iteration_details.num_ctx_requests,
+            iteration_details.num_ctx_tokens,
+            iteration_details.num_generation_requests,
+            iteration_details.num_generation_tokens,
+            (time.monotonic() - before) * 1000,
+        )
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
