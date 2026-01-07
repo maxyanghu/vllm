@@ -175,7 +175,6 @@ async def async_request_openai_completions(
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
     }
     _update_headers_common(headers, request_func_input)
-
     output = RequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
 
