@@ -183,3 +183,82 @@ def vit_torch_sdpa_wrapper(
     cu_seqlens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.torch_sdpa_wrapper(q, k, v, scale, cu_seqlens)
+
+
+def flashinfer_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    workspace_buffer: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    from vllm.v1.attention.backends.flashinfer import cudnn_batch_prefill_with_kv_cache
+
+    is_reshaped = q.dim() == 4
+    batch_size = q.shape[0]
+    if is_reshaped:
+        q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
+
+    q_len = q.size(0)
+    if cu_seqlens is None:
+        cu_seqlens = torch.full((1, 1, 1, 1), q_len, dtype=torch.int32, device=q.device)
+    elif cu_seqlens.dim() == 1:
+        cu_seqlens = cu_seqlens[:, None, None, None]
+    max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
+
+    output = cudnn_batch_prefill_with_kv_cache(
+        q,
+        k,
+        v,
+        scale,
+        workspace_buffer,
+        max_token_per_sequence=max_seqlen,
+        max_sequence_kv=max_seqlen,
+        actual_seq_lens_q=cu_seqlens,
+        actual_seq_lens_kv=cu_seqlens,
+        causal=False,
+        return_lse=False,
+    )
+    if isinstance(output, tuple):
+        for i in output:
+            if isinstance(i, torch.Tensor):
+                output = i
+    if is_reshaped:
+        output = einops.rearrange(output, "(b s) h d -> b s h d", b=batch_size)
+
+    return output
+
+
+def vit_flashinfer_wrapper_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    workspace_buffer: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+direct_register_custom_op(
+    op_name="flashinfer_wrapper",
+    op_func=flashinfer_wrapper,
+    fake_impl=vit_flashinfer_wrapper_fake,
+)
+
+
+def vit_flashinfer_wrapper(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    workspace_buffer: torch.Tensor,
+    cu_seqlens: torch.Tensor | None = None,
+    max_seqlen: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops.vllm.flashinfer_wrapper(
+        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen
+    )

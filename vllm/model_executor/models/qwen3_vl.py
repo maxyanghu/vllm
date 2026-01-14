@@ -214,6 +214,7 @@ class Qwen3_VisionBlock(nn.Module):
         multimodal_config: MultiModalConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        workspace_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -227,6 +228,7 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             multimodal_config=multimodal_config,
             prefix=f"{prefix}.attn",
+            workspace_buffer=workspace_buffer,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -398,10 +400,18 @@ class Qwen3_VisionTransformer(nn.Module):
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.FLASHINFER,
         }:
             raise RuntimeError(
                 f"Qwen3-VL does not support {self.attn_backend} backend now."
             )
+
+        workspace_buffer = (
+            None
+            if self.attn_backend != AttentionBackendEnum.FLASHINFER
+            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+        )
+
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
@@ -413,6 +423,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     quant_config=quant_config,
                     multimodal_config=multimodal_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
+                    workspace_buffer=workspace_buffer,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -538,6 +549,7 @@ class Qwen3_VisionTransformer(nn.Module):
         max_seqlen = torch.zeros([], device=cu_seqlens.device)
         if (
             self.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            or self.attn_backend == AttentionBackendEnum.FLASHINFER
             or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
         ):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
