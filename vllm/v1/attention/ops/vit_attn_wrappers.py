@@ -193,6 +193,7 @@ def flashinfer_wrapper(
     workspace_buffer: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
+    act_seq_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from vllm.v1.attention.backends.flashinfer import cudnn_batch_prefill_with_kv_cache
 
@@ -202,10 +203,8 @@ def flashinfer_wrapper(
         q, k, v = (einops.rearrange(x, "b s ... -> (b s) ...") for x in [q, k, v])
 
     q_len = q.size(0)
-    if cu_seqlens is None:
-        cu_seqlens = torch.full((1, 1, 1, 1), q_len, dtype=torch.int32, device=q.device)
-    elif cu_seqlens.dim() == 1:
-        cu_seqlens = cu_seqlens[:, None, None, None]
+    batch_offsets = cu_seqlens.view(-1, 1, 1, 1)
+    actual_seq_lens = act_seq_lens.view(-1, 1, 1, 1)
     max_seqlen = q_len if max_seqlen is None else max_seqlen.item()
 
     output = cudnn_batch_prefill_with_kv_cache(
@@ -216,10 +215,14 @@ def flashinfer_wrapper(
         workspace_buffer,
         max_token_per_sequence=max_seqlen,
         max_sequence_kv=max_seqlen,
-        actual_seq_lens_q=cu_seqlens,
-        actual_seq_lens_kv=cu_seqlens,
+        actual_seq_lens_q=actual_seq_lens,
+        actual_seq_lens_kv=actual_seq_lens,
         causal=False,
         return_lse=False,
+        batch_offsets_q=batch_offsets,
+        batch_offsets_o=batch_offsets,
+        batch_offsets_k=batch_offsets,
+        batch_offsets_v=batch_offsets,
     )
     if isinstance(output, tuple):
         for i in output:
@@ -239,6 +242,7 @@ def vit_flashinfer_wrapper_fake(
     workspace_buffer: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
+    act_seq_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty_like(q)
 
@@ -258,7 +262,8 @@ def vit_flashinfer_wrapper(
     workspace_buffer: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
     max_seqlen: torch.Tensor | None = None,
+    act_seq_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops.vllm.flashinfer_wrapper(
-        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen
+        q, k, v, scale, workspace_buffer, cu_seqlens, max_seqlen, act_seq_lens
     )

@@ -247,6 +247,7 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
+        act_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -254,6 +255,7 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
+            act_seq_lens=act_seq_lens,
         )
 
         x = x + self.mlp(self.norm2(x))
@@ -409,7 +411,7 @@ class Qwen3_VisionTransformer(nn.Module):
         workspace_buffer = (
             None
             if self.attn_backend != AttentionBackendEnum.FLASHINFER
-            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
         )
 
         self.blocks = nn.ModuleList(
@@ -578,10 +580,15 @@ class Qwen3_VisionTransformer(nn.Module):
             axis=0, dtype=np.int32
         )
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        act_seq_lens = torch.from_numpy(cu_seqlens[1:] - cu_seqlens[:-1])
+        act_seq_lens = act_seq_lens.to(self.device, non_blocking=True)
+
         cu_seqlens = torch.from_numpy(cu_seqlens)
 
         hidden_states = hidden_states.unsqueeze(1)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            cu_seqlens = cu_seqlens * self.hidden_size
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
@@ -592,6 +599,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
+                act_seq_lens=act_seq_lens,
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
