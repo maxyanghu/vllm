@@ -310,6 +310,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         quant_config: QuantizationConfig | None = None,
         multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
+        workspace_buffer: torch.Tensor | None = None,  # Only used for FlashInfer
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
@@ -355,6 +356,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             head_size=self.hidden_size_per_attention_head,
             scale=self.hidden_size_per_attention_head**-0.5,
             multimodal_config=multimodal_config,
+            workspace_buffer=workspace_buffer,
         )
 
         self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
@@ -366,6 +368,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
+        act_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
@@ -406,6 +409,7 @@ class Qwen2_5_VisionAttention(nn.Module):
             value=v,
             cu_seqlens=cu_seqlens,
             max_seqlen=max_seqlen,
+            act_seq_lens=act_seq_lens,
         )
 
         context_layer = einops.rearrange(
@@ -436,6 +440,7 @@ class Qwen2_5_VisionBlock(nn.Module):
         quant_config: QuantizationConfig | None = None,
         multimodal_config: MultiModalConfig | None = None,
         prefix: str = "",
+        workspace_buffer: torch.Tensor | None = None,  # Only used for FlashInfer
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -449,6 +454,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             quant_config=quant_config,
             multimodal_config=multimodal_config,
             prefix=f"{prefix}.attn",
+            workspace_buffer=workspace_buffer,
         )
         self.mlp = Qwen2_5_VisionMLP(
             dim,
@@ -634,11 +640,16 @@ class Qwen2_5_VisionTransformer(nn.Module):
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.FLASHINFER,
         }:
             raise RuntimeError(
                 f"Qwen2.5-VL does not support {self.attn_backend} backend now."
             )
-
+        workspace_buffer = (
+            None
+            if self.attn_backend != AttentionBackendEnum.FLASHINFER
+            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+        )
         with set_model_tag("Qwen2_5_VisionBlock", is_encoder=True):
             self.blocks = nn.ModuleList(
                 [
@@ -651,6 +662,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
                         quant_config=quant_config,
                         multimodal_config=multimodal_config,
                         prefix=f"{prefix}.blocks.{layer_idx}",
+                        workspace_buffer=workspace_buffer,
                     )
                     for layer_idx in range(depth)
                 ]

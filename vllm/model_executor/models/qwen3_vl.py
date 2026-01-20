@@ -214,6 +214,7 @@ class Qwen3_VisionBlock(nn.Module):
         multimodal_config: MultiModalConfig | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        workspace_buffer: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -227,6 +228,7 @@ class Qwen3_VisionBlock(nn.Module):
             quant_config=quant_config,
             multimodal_config=multimodal_config,
             prefix=f"{prefix}.attn",
+            workspace_buffer=workspace_buffer,
         )
         self.mlp = Qwen3_VisionMLP(
             dim,
@@ -245,6 +247,7 @@ class Qwen3_VisionBlock(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
+        act_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x),
@@ -252,6 +255,7 @@ class Qwen3_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
+            act_seq_lens=act_seq_lens,
         )
 
         x = x + self.mlp(self.norm2(x))
@@ -398,10 +402,18 @@ class Qwen3_VisionTransformer(nn.Module):
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.FLASHINFER,
         }:
             raise RuntimeError(
                 f"Qwen3-VL does not support {self.attn_backend} backend now."
             )
+
+        workspace_buffer = (
+            None
+            if self.attn_backend != AttentionBackendEnum.FLASHINFER
+            else torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=self.device)
+        )
+
         self.blocks = nn.ModuleList(
             [
                 Qwen3_VisionBlock(
@@ -413,6 +425,7 @@ class Qwen3_VisionTransformer(nn.Module):
                     quant_config=quant_config,
                     multimodal_config=multimodal_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
+                    workspace_buffer=workspace_buffer,
                 )
                 for layer_idx in range(vision_config.depth)
             ]
@@ -538,6 +551,7 @@ class Qwen3_VisionTransformer(nn.Module):
         max_seqlen = torch.zeros([], device=cu_seqlens.device)
         if (
             self.attn_backend == AttentionBackendEnum.FLASH_ATTN
+            or self.attn_backend == AttentionBackendEnum.FLASHINFER
             or self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA
         ):
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -566,10 +580,15 @@ class Qwen3_VisionTransformer(nn.Module):
             axis=0, dtype=np.int32
         )
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+        act_seq_lens = torch.from_numpy(cu_seqlens[1:] - cu_seqlens[:-1])
+        act_seq_lens = act_seq_lens.to(self.device, non_blocking=True)
+
         cu_seqlens = torch.from_numpy(cu_seqlens)
 
         hidden_states = hidden_states.unsqueeze(1)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+        if self.attn_backend == AttentionBackendEnum.FLASHINFER:
+            cu_seqlens = cu_seqlens * self.num_heads * self.hidden_size
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
@@ -580,6 +599,7 @@ class Qwen3_VisionTransformer(nn.Module):
                 rotary_pos_emb_cos=rotary_pos_emb_cos,
                 rotary_pos_emb_sin=rotary_pos_emb_sin,
                 max_seqlen=max_seqlen,
+                act_seq_lens=act_seq_lens,
             )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
