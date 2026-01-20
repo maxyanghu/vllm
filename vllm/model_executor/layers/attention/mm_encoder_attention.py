@@ -200,7 +200,7 @@ class MMEncoderAttention(CustomOp):
             scale=self.scale,
             workspace_buffer=self.workspace_buffer,
             cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
+            max_seqlen=torch.tensor(32768), #Hard code for now, This will remove the dependency on max_seqlen. Set it to arbitrarily large  (128K)
             act_seq_lens=act_seq_lens,
         )
 

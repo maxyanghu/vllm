@@ -588,7 +588,7 @@ class Qwen3_VisionTransformer(nn.Module):
         hidden_states = hidden_states.unsqueeze(1)
         max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
         if self.attn_backend == AttentionBackendEnum.FLASHINFER:
-            cu_seqlens = cu_seqlens * self.hidden_size
+            cu_seqlens = cu_seqlens * self.num_heads * self.hidden_size
         cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
 
         deepstack_feature_lists = []
