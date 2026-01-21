@@ -402,7 +402,8 @@ class Qwen2_5_VisionAttention(nn.Module):
             q, k = qk_rotated.unbind(dim=0)
         else:
             q, k, v = qkv.unbind(dim=2)
-
+        if self.attn.attn_backend == AttentionBackendEnum.FLASHINFER:
+            cu_seqlens = cu_seqlens // self.tp_size
         context_layer = self.attn(
             query=q,
             key=k,
