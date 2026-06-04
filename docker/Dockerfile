@@ -1036,6 +1036,57 @@ FROM vllm-openai-base AS vllm-openai
 ENTRYPOINT ["vllm", "serve"]
 #################### OPENAI API SERVER ####################
 
+#################### BENCHMARK/INTERACTIVE DEVELOPMENT IMAGE ####################
+FROM vllm-openai-base AS vllm-bench-dev
+
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        git \
+        less \
+        procps \
+        vim-tiny \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/opt/uv/cache \
+    uv pip install --system pandas matplotlib seaborn datasets scipy plotly
+
+WORKDIR /workspace/vllm-src
+COPY pyproject.toml setup.py README.md ./
+COPY benchmarks benchmarks
+COPY examples examples
+COPY vllm vllm
+
+RUN python3 - <<'PY_INNER'
+from importlib import metadata
+from pathlib import Path
+import shutil
+
+installed_pkg = Path(metadata.distribution("vllm").locate_file("vllm")).resolve()
+source_pkg = Path("/workspace/vllm-src/vllm").resolve()
+
+for artifact in installed_pkg.rglob("*.so"):
+    dest = source_pkg / artifact.relative_to(installed_pkg)
+    if artifact.resolve() == dest.resolve():
+        continue
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(artifact, dest)
+
+for name in ("vllm-rs",):
+    artifact = installed_pkg / name
+    if artifact.exists():
+        dest = source_pkg / name
+        if artifact.resolve() != dest.resolve():
+            shutil.copy2(artifact, dest)
+PY_INNER
+
+ENV PYTHONPATH=/workspace/vllm-src
+RUN mkdir -p /workspace/.cache \
+    && chmod -R a+rwX /workspace
+
+ENTRYPOINT []
+CMD ["/bin/bash"]
+#################### BENCHMARK/INTERACTIVE DEVELOPMENT IMAGE ####################
+
 #################### OPENAI API SERVER (NON-ROOT, OPT-IN) ####################
 # Non-root-ready variant of `vllm-openai`. Built via:
 #   docker build --target vllm-openai-nonroot -t vllm:openai-nonroot \
