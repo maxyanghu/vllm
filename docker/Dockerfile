@@ -1063,6 +1063,9 @@ import shutil
 
 installed_pkg = Path(metadata.distribution("vllm").locate_file("vllm")).resolve()
 source_pkg = Path("/workspace/vllm-src/vllm").resolve()
+generated_version = installed_pkg / "_version.py"
+if generated_version.exists():
+    shutil.copy2(generated_version, source_pkg / "_version.py")
 
 for artifact in installed_pkg.rglob("*.so"):
     dest = source_pkg / artifact.relative_to(installed_pkg)
