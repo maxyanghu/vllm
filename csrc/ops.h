@@ -496,6 +496,36 @@ void beam_allreduce(torch::stable::Tensor const& input,
                     int64_t world, int64_t rank);
 #endif
 
+#ifdef VLLM_ENABLE_MUSE_SPARK
+// Muse Spark specialized decode (csrc/muse_spark/).
+// Attention front: QKV projection GEMM + QK-norm + RoPE + KV insert in one
+// launch (1 <= M <= 16, K = 8192, head_dim 64, bf16).
+void fused_muse_spark_qkv_qknorm_rope_kv_insert(
+    torch::stable::Tensor const& x, torch::stable::Tensor const& weight,
+    torch::stable::Tensor const& positions,
+    std::optional<torch::stable::Tensor> cos_sin_cache,
+    torch::stable::Tensor const& slot_mapping, torch::stable::Tensor& kv_cache,
+    torch::stable::Tensor& out, double eps);
+// Paged decode attention + output norm + sigmoid gate (8-token verify).
+void muse_spark_attn2(torch::stable::Tensor const& q,
+                      torch::stable::Tensor const& kv_cache,
+                      torch::stable::Tensor const& block_table,
+                      torch::stable::Tensor const& seq_lens,
+                      std::optional<torch::stable::Tensor> o_norm_weight,
+                      torch::stable::Tensor const& gate,
+                      torch::stable::Tensor& out, int64_t kv_heads_per_rank,
+                      bool enable_pdl, int64_t max_seq_len,
+                      int64_t sliding_window, int64_t num_splits,
+                      std::optional<torch::stable::Tensor> workspace);
+// Sigmoid + bias top-8 routing for decode batches of at most 8 tokens, and
+// optionally the routing metadata of this rank's experts.
+void muse_spark_routing_shorttail(
+    torch::stable::Tensor const& logits, torch::stable::Tensor const& bias,
+    torch::stable::Tensor& ids, torch::stable::Tensor& weights, double scale,
+    bool renormalize, std::optional<torch::stable::Tensor> const& metadata,
+    int64_t local_expert_offset, int64_t num_local_experts, int64_t tile_n);
+#endif
+
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
 void kimi_k3_attn_res(torch::stable::Tensor& prefix,
                       std::optional<torch::stable::Tensor> delta,

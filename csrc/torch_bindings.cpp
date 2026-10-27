@@ -596,6 +596,31 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor! flags, int multicast_ptr, int world, int rank) -> ()");
 #endif
 
+#ifdef VLLM_ENABLE_MUSE_SPARK
+  // Muse Spark specialized decode (csrc/muse_spark/).
+  // out = x @ weight^T with QK-norm and RoPE applied, K/V written to kv_cache
+  // at slot_mapping.
+  ops.def(
+      "muse_spark_qkv_front("
+      "Tensor x, Tensor weight, Tensor positions, Tensor? cos_sin_cache, "
+      "Tensor slot_mapping, Tensor! kv_cache, Tensor! out, float eps) -> ()");
+  // Paged decode attention + output RMS norm + sigmoid gate into out. A
+  // max_seq_len above 2048 or a sliding window needs workspace.
+  ops.def(
+      "muse_spark_attn2("
+      "Tensor q, Tensor kv_cache, Tensor block_table, Tensor seq_lens, "
+      "Tensor? o_norm_weight, Tensor gate, Tensor! out, "
+      "int kv_heads_per_rank, bool enable_pdl, int max_seq_len, "
+      "int sliding_window, int num_splits, Tensor!? workspace) -> ()");
+  // Sigmoid + bias top-k routing: expert ids and weights into ids/weights,
+  // and optionally the routing metadata of the local experts into metadata.
+  ops.def(
+      "muse_spark_routing_shorttail("
+      "Tensor logits, Tensor bias, Tensor! ids, Tensor! weights, "
+      "float scale, bool renormalize, Tensor!? metadata, "
+      "int local_expert_offset, int num_local_experts, int tile_n) -> ()");
+#endif
+
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
   ops.def(
       "kimi_k3_attn_res("
@@ -896,6 +921,14 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #ifdef VLLM_ENABLE_BEAM_KERNELS
   ops.impl("beam_allreduce_norm", TORCH_BOX(&beam_allreduce_norm));
   ops.impl("beam_allreduce", TORCH_BOX(&beam_allreduce));
+#endif
+
+#ifdef VLLM_ENABLE_MUSE_SPARK
+  ops.impl("muse_spark_qkv_front",
+           TORCH_BOX(&fused_muse_spark_qkv_qknorm_rope_kv_insert));
+  ops.impl("muse_spark_attn2", TORCH_BOX(&muse_spark_attn2));
+  ops.impl("muse_spark_routing_shorttail",
+           TORCH_BOX(&muse_spark_routing_shorttail));
 #endif
 
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES

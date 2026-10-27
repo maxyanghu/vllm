@@ -1221,6 +1221,29 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
       "Building Kimi K3 AttnRes for archs: ${KIMI_K3_ATTN_RES_ARCHS}")
   endif()
 
+  # Muse Spark specialized decode kernels (thread-block clusters, TMA,
+  # st.async, PDL): SM100 family.
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    cuda_archs_loose_intersection(MUSE_SPARK_ARCHS
+      "10.0f" "${CUDA_ARCHS}")
+  endif()
+  if(MUSE_SPARK_ARCHS)
+    set(MUSE_SPARK_ATTN2_SRC
+      "csrc/muse_spark/attn2_kernel.cu")
+    set(MUSE_SPARK_SRC
+      "csrc/muse_spark/qkv_front_kernel.cu"
+      "${MUSE_SPARK_ATTN2_SRC}"
+      "csrc/muse_spark/routing_shorttail_kernel.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${MUSE_SPARK_SRC}"
+      CUDA_ARCHS "${MUSE_SPARK_ARCHS}")
+    set_property(SOURCE ${MUSE_SPARK_ATTN2_SRC} APPEND PROPERTY
+      COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>")
+    list(APPEND VLLM_STABLE_EXT_SRC "${MUSE_SPARK_SRC}")
+    message(STATUS
+      "Building Muse Spark decode kernels for archs: ${MUSE_SPARK_ARCHS}")
+  endif()
+
   # Hadacore kernels
   cuda_archs_loose_intersection(HADACORE_ARCHS "8.0+PTX;9.0+PTX" "${CUDA_ARCHS}")
   if(HADACORE_ARCHS)
@@ -1307,6 +1330,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     if(BEAM_KERNEL_ARCHS)
       target_compile_definitions(_C_stable_libtorch PRIVATE
         VLLM_ENABLE_BEAM_KERNELS=1)
+    endif()
+    if(MUSE_SPARK_ARCHS)
+      target_compile_definitions(_C_stable_libtorch PRIVATE
+        VLLM_ENABLE_MUSE_SPARK=1)
     endif()
     # Needed by CUTLASS kernels
     target_compile_definitions(_C_stable_libtorch PRIVATE

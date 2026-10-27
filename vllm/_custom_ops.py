@@ -2756,6 +2756,161 @@ def fused_muse_spark_qknorm_rope_kv_insert(
     )
 
 
+# Muse Spark specialized decode ops (csrc/muse_spark/). Each writes into
+# caller-owned buffers, so a captured decode step allocates nothing.
+def muse_spark_qkv_front(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
+    slot_mapping: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+) -> None:
+    """``out = x @ weight.T`` with the q and k heads RMS-normalized (and rotated
+    when ``cos_sin_cache`` is given); writes the k and v heads to the bf16 paged
+    ``kv_cache`` at ``slot_mapping`` (-1 skips a token). Decode batches of 1 to
+    16 tokens, hidden size 8192, head_dim 64."""
+    torch.ops._C.muse_spark_qkv_front(
+        x, weight, positions, cos_sin_cache, slot_mapping, kv_cache, out, eps
+    )
+
+
+def muse_spark_attn2(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    o_norm_weight: torch.Tensor | None,
+    gate: torch.Tensor,
+    out: torch.Tensor,
+    kv_heads_per_rank: int,
+    enable_pdl: bool,
+    max_seq_len: int = 2048,
+    sliding_window: int = 0,
+    num_splits: int = 1,
+    workspace: torch.Tensor | None = None,
+) -> None:
+    """Paged decode attention of 8 query rows per request (head_dim 64, 8 query
+    heads per KV head, bf16 cache, 16-token pages, contexts up to
+    ``max_seq_len``, an optional sliding window), then the per-head output RMS
+    norm and the sigmoid gate, into ``out``. A ``max_seq_len`` above 2048 or a
+    window selects the split kernel, which runs over ``num_splits`` z slices and
+    needs ``workspace``."""
+    torch.ops._C.muse_spark_attn2(
+        q,
+        kv_cache,
+        block_table,
+        seq_lens,
+        o_norm_weight,
+        gate,
+        out,
+        kv_heads_per_rank,
+        enable_pdl,
+        max_seq_len,
+        sliding_window,
+        num_splits,
+        workspace,
+    )
+
+
+def muse_spark_routing_shorttail(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    ids: torch.Tensor,
+    weights: torch.Tensor,
+    scale: float,
+    renormalize: bool,
+    metadata: torch.Tensor | None = None,
+    local_expert_offset: int = 0,
+    num_local_experts: int = 0,
+    tile_n: int = 0,
+) -> None:
+    """Top-k of ``sigmoid(logits) + bias`` for at most 8 tokens: the global
+    expert ids into ``ids`` and the (renormalized, scaled) sigmoid scores of
+    those experts into ``weights``. With ``metadata`` (int32), also the
+    TRT-LLM-gen routing metadata of the local experts ``[local_expert_offset,
+    local_expert_offset + num_local_experts)`` for GEMM tile ``tile_n``."""
+    torch.ops._C.muse_spark_routing_shorttail(
+        logits,
+        bias,
+        ids,
+        weights,
+        scale,
+        renormalize,
+        metadata,
+        local_expert_offset,
+        num_local_experts,
+        tile_n,
+    )
+
+
+if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "muse_spark_qkv_front"):
+
+    @register_fake("_C::muse_spark_qkv_front")
+    def _muse_spark_qkv_front_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        positions: torch.Tensor,
+        cos_sin_cache: torch.Tensor | None,
+        slot_mapping: torch.Tensor,
+        kv_cache: torch.Tensor,
+        out: torch.Tensor,
+        eps: float,
+    ) -> None:
+        torch._check(x.dim() == 2 and weight.dim() == 2 and out.dim() == 2)
+        torch._check(x.shape[1] == weight.shape[1])
+        torch._check(out.shape[0] == x.shape[0])
+        torch._check(out.shape[1] == weight.shape[0])
+
+    @register_fake("_C::muse_spark_attn2")
+    def _muse_spark_attn2_fake(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        o_norm_weight: torch.Tensor | None,
+        gate: torch.Tensor,
+        out: torch.Tensor,
+        kv_heads_per_rank: int,
+        enable_pdl: bool,
+        max_seq_len: int,
+        sliding_window: int,
+        num_splits: int,
+        workspace: torch.Tensor | None,
+    ) -> None:
+        # The op's row contract: q, gate and out are [8 R, width] for R
+        # requests; the block table and seq_lens hold at least R rows.
+        torch._check(kv_heads_per_rank >= 1)
+        torch._check(max_seq_len >= 8 and sliding_window >= 0 and num_splits >= 1)
+        torch._check(q.dim() == 2 and q.shape[0] >= 8 and q.shape[0] % 8 == 0)
+        torch._check(gate.shape == q.shape and out.shape == q.shape)
+        torch._check(block_table.dim() == 2 and seq_lens.dim() == 1)
+        num_reqs = q.shape[0] // 8
+        torch._check(block_table.shape[0] >= num_reqs)
+        torch._check(seq_lens.shape[0] >= num_reqs)
+
+    @register_fake("_C::muse_spark_routing_shorttail")
+    def _muse_spark_routing_shorttail_fake(
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        ids: torch.Tensor,
+        weights: torch.Tensor,
+        scale: float,
+        renormalize: bool,
+        metadata: torch.Tensor | None,
+        local_expert_offset: int,
+        num_local_experts: int,
+        tile_n: int,
+    ) -> None:
+        torch._check(logits.dim() == 2 and bias.dim() == 1)
+        torch._check(logits.shape[1] == bias.shape[0])
+        torch._check(ids.dim() == 2 and ids.shape[0] == logits.shape[0])
+        torch._check(weights.shape == ids.shape)
+        torch._check(metadata is None or metadata.dim() == 1)
+
+
 def fused_minimax_m3_qknorm_rope_kv_insert(
     qkv: torch.Tensor,
     q_norm_weight: torch.Tensor,
