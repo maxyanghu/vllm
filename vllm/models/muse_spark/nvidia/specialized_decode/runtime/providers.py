@@ -242,6 +242,8 @@ class QkvAttention:
         self.oproj, self.qkv, self.out, self.partial = oproj, qkv, out, partial
         self.stock_attention = False
         self.query: torch.Tensor | None = None
+        self.fi_workspace: torch.Tensor | None = None
+        self.kv_counters: torch.Tensor | None = None
 
     @classmethod
     def unsupported(cls, vllm_config) -> str | None:
@@ -321,7 +323,23 @@ class QkvAttention:
         impl = attn.attn.impl
         if impl.sinks is not None or impl.cache_dtype not in ("auto", "bfloat16"):
             raise ValueError(f"{self.layer_name}: unsupported stock decode attention")
+        counters = getattr(impl, "_multi_ctas_kv_counter_buffer", None)
+        if counters is None:
+            # Without it FlashInfer allocates a zeroed buffer on every call.
+            raise ValueError(
+                f"{self.layer_name}: the stock decode attention needs the "
+                "backend's multi-CTA KV counter buffer"
+            )
+        from vllm.v1.attention.backends.flashinfer import (
+            _get_trtllm_workspace_buffer,
+        )
+
         self.stock_attention = True
+        self.max_context = ctx.max_context
+        # Bound before capture: the shared TRT-LLM-gen workspace (created on
+        # first use) and the counter buffer the stock decode passes.
+        self.fi_workspace = _get_trtllm_workspace_buffer()
+        self.kv_counters = counters
         # The query as FlashInfer takes it: [rows, heads, head_dim], contiguous
         # (the QKV front leaves q as a column view of its output).
         self.query = ctx.buffers.get("stock_attention_query")
@@ -345,9 +363,7 @@ class QkvAttention:
         from flashinfer.decode import trtllm_batch_decode_with_kv_cache
 
         from vllm.models.muse_spark.nvidia.model import o_norm_sigmoid_gate
-        from vllm.v1.attention.backends.flashinfer import (
-            _get_trtllm_workspace_buffer,
-        )
+        from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
 
         from . import csrc_ops
 
@@ -362,8 +378,11 @@ class QkvAttention:
         bmm2_scale = impl.bmm2_scale if impl.bmm2_scale is not None else 1.0
         trtllm_batch_decode_with_kv_cache(
             query=query,
-            kv_cache=kv_cache.split(head_dim, dim=-1),
-            workspace_buffer=_get_trtllm_workspace_buffer(),
+            kv_cache=tuple(
+                canonicalize_singleton_dim_strides(view)
+                for view in kv_cache.split(head_dim, dim=-1)
+            ),
+            workspace_buffer=self.fi_workspace,
             block_tables=decode.block_tables,
             seq_lens=decode.seq_lens,
             max_seq_len=decode.max_seq_len,
@@ -377,9 +396,7 @@ class QkvAttention:
             # trtllm_batch_decode_with_kv_cache runs both).
             backend="trtllm-gen",
             q_len_per_req=csrc_ops.QUERY_LEN,
-            multi_ctas_kv_counter_buffer=getattr(
-                impl, "_multi_ctas_kv_counter_buffer", None
-            ),
+            multi_ctas_kv_counter_buffer=self.kv_counters,
         )
         assert o_norm_sigmoid_gate is not None
         o_norm_sigmoid_gate(
@@ -400,6 +417,31 @@ class QkvAttention:
                 f"bf16 [pages, {self.num_kv_heads}, 16, 128] layout with dense "
                 "pages the decode kernels read"
             )
+        if self.stock_attention:
+            self.warm_up_stock_attention(kv_cache)
+
+    def warm_up_stock_attention(self, kv_cache: torch.Tensor) -> None:
+        """One eager stock decode on this cache before capture, at the shape a
+        capture records (8 rows, the deployment's max_seq_len), so that
+        TRT-LLM-gen loads its kernel and the o-norm/gate compiles outside the
+        capture: the warm-up runs the stock forward, which may have picked
+        another decode kernel. It reads page 0 only and writes the scratch."""
+        from types import SimpleNamespace
+
+        from . import csrc_ops
+
+        device = kv_cache.device
+        rows = csrc_ops.QUERY_LEN
+        pages = -(-self.max_context // csrc_ops.BLOCK_SIZE)
+        decode = SimpleNamespace(
+            block_tables=torch.zeros(1, pages, dtype=torch.int32, device=device),
+            seq_lens=torch.full((1,), rows, dtype=torch.int32, device=device),
+            max_seq_len=self.max_context,
+        )
+        q = torch.zeros(rows, self.attn.num_heads * self.attn.head_dim, device=device)
+        q = q.to(torch.bfloat16)
+        self.stock_decode_attention(q, q, kv_cache, decode)
+        torch.accelerator.synchronize(device)
 
     def front_call(
         self, step: Step, x: torch.Tensor

@@ -96,38 +96,57 @@ def test_full_attention_decode(kv_heads, length):
         kv_heads, True, MAX_LEN, 0, splits, ws,
     )  # fmt: skip
 
-    # The stock path, through the provider's method on a stand-in layer.
-    impl = SimpleNamespace(
-        bmm1_scale=SCALE, bmm2_scale=1.0, scale=SCALE, sinks=None, cache_dtype="auto"
+    # The stock path, through the provider on a stand-in layer: the
+    # pre-capture warm-up, then the capture with no eager call at this shape.
+    from vllm.v1.attention.backends.flashinfer import (
+        _get_multi_ctas_kv_counter_buffer,
+        _get_trtllm_workspace_buffer,
     )
-    attn = SimpleNamespace(
+
+    impl = SimpleNamespace(
+        bmm1_scale=None, bmm2_scale=None, scale=SCALE, sinks=None, cache_dtype="auto"
+    )
+    provider = object.__new__(QkvAttention)
+    provider.attn = SimpleNamespace(
         num_heads=heads,
         head_dim=HEAD_DIM,
         rms_norm_eps=EPS,
         attn=SimpleNamespace(impl=impl),
     )
-    provider = SimpleNamespace(
-        attn=attn,
-        query=torch.empty(16, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev),
-        out=torch.empty(16, width, dtype=torch.bfloat16, device=dev),
-    )
+    provider.max_context = MAX_LEN
+    provider.query = torch.empty(16, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
+    provider.out = torch.empty(16, width, dtype=torch.bfloat16, device=dev)
+    provider.fi_workspace = _get_trtllm_workspace_buffer()
+    provider.kv_counters = _get_multi_ctas_kv_counter_buffer(1 << 20, dev)
+    provider.warm_up_stock_attention(cache)
     decode = SimpleNamespace(
-        block_tables=block_table,
-        seq_lens=seq_lens,
-        max_seq_len=MAX_LEN,
+        block_tables=block_table, seq_lens=seq_lens, max_seq_len=MAX_LEN
     )
-    stock = QkvAttention.stock_decode_attention(provider, q, gate, cache, decode)
-    stock = stock.clone()
-
-    # Replayed from a graph on new cache contents gives the eager bits.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = QkvAttention.stock_decode_attention(provider, q, gate, cache, decode)
+        captured = provider.stock_decode_attention(q, gate, cache, decode)
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.equal(captured.view(torch.int16), stock.view(torch.int16))
+    stock = captured.clone()
+    eager = provider.stock_decode_attention(q, gate, cache, decode).clone()
+    assert torch.equal(eager.view(torch.int16), stock.view(torch.int16))
 
     e2, es = _rel(out2, ref), _rel(stock, ref)
     print(f"kv_heads {kv_heads} L {length}: attn2 {e2:.2e} stock {es:.2e}")
     assert es < 6e-3, es
     assert e2 < 6e-3, e2
+
+    # The replay reads the step's inputs: new queries, cache, pages and a
+    # shorter length, in place.
+    shorter = max(ROWS, length // 2 + 3)
+    front.copy_(torch.randn_like(front, dtype=torch.float32).to(torch.bfloat16))
+    cache.copy_((torch.randn_like(cache, dtype=torch.float32) * 0.5).to(cache.dtype))
+    block_table.copy_(torch.randperm(pages + 3, device=dev).to(torch.int32)[:pages])
+    seq_lens.fill_(shorter)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = captured.clone()  # the eager call below writes the same scratch
+    ref2 = _reference(q, gate, cache, block_table, shorter, kv_heads)
+    eager2 = provider.stock_decode_attention(q, gate, cache, decode).clone()
+    assert torch.equal(replayed.view(torch.int16), eager2.view(torch.int16))
+    assert _rel(replayed, ref2) < 6e-3
