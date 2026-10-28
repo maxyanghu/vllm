@@ -30,6 +30,10 @@ class DecodeConfig:
     # (cutedsl/moe/persistent_experts.py) instead of TRT-LLM-gen's GEMMs, on
     # the stock EP experts (no expert TP). See persistent_experts().
     persistent_experts: bool = True
+    # The full-attention layers' decode attention on the stock path's
+    # TRT-LLM-gen decode + o-norm/gate instead of attn2. See
+    # stock_full_attention().
+    stock_full_attention: bool = False
 
 
 def decode_backend(vllm_config) -> str:
@@ -57,7 +61,31 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
         persistent_experts=persistent_experts(vllm_config),
+        stock_full_attention=stock_full_attention(vllm_config),
     )
+
+
+# max_model_len from which the full-attention layers run the stock path's
+# TRT-LLM-gen decode by default: it is slower than attn2 below about 16k keys
+# (about 10 us per layer at any length) and 2.4-3.4x faster from 100k up.
+STOCK_FULL_ATTENTION_MIN_CONTEXT = 32768
+
+
+def stock_full_attention(vllm_config) -> bool:
+    """Whether the full-attention layers run the stock decode attention: when
+    max_model_len is at least STOCK_FULL_ATTENTION_MIN_CONTEXT, or as
+    ``additional_config`` sets ``"stock_full_attention"`` (true or false).
+    Reads the config only, so every rank agrees."""
+    extra = vllm_config.additional_config
+    default = vllm_config.model_config.max_model_len >= STOCK_FULL_ATTENTION_MIN_CONTEXT
+    wanted = (
+        extra.get("stock_full_attention", default)
+        if isinstance(extra, dict)
+        else default
+    )
+    if not isinstance(wanted, bool):
+        raise ValueError("additional_config stock_full_attention must be a bool")
+    return wanted
 
 
 # The TP sizes whose NVFP4 experts run the persistent expert kernel by default.

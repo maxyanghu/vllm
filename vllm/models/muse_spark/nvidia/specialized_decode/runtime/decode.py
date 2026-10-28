@@ -166,6 +166,7 @@ class SpecializedDecode:
             self.aux_layers,
             config.max_context,
             all_reduce_order,
+            config.stock_full_attention,
         )
         self.layout = layout = LAYOUTS[self.tp]
         self.build(ctx, layout)
@@ -176,13 +177,14 @@ class SpecializedDecode:
         self.logged: set[str] = set()
         logger.info(
             "Muse Spark specialized decode built: TP%d, %d layers, aux layers %s; "
-            "routed experts: %s",
+            "routed experts: %s; full-attention decode: %s",
             self.tp,
             len(self.layers),
             self.aux_layers,
             "persistent kernel"
             if self.persistent_experts
             else ("expert TP" if tp_experts else "TRT-LLM-gen EP"),
+            "stock TRT-LLM-gen" if config.stock_full_attention else "attn2",
         )
 
     def build(self, ctx: BuildContext, layout: Layout) -> None:

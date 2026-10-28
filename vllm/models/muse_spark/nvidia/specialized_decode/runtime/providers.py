@@ -65,6 +65,9 @@ class BuildContext(NamedTuple):
     # The sum order of the stock TP all-reduce, which the fused all-reduces
     # take (``policy.FUSED_TPS``; ``flashinfer_ops.stock_sum_order``), else None.
     all_reduce_order: str | None
+    # The full-attention layers' decode attention runs the stock path's
+    # TRT-LLM-gen decode + o-norm/gate instead of attn2 (DecodeConfig).
+    stock_full_attention: bool = False
 
 
 class Provider(Protocol):
@@ -205,7 +208,16 @@ class QkvAttention:
     GEMM, QK norm, RoPE and the K/V insert), attn2 (csrc muse_spark_attn2: paged
     attention of the 8-token verify step with the o-norm and sigmoid gate) and
     the o_proj partial (``OProjection``: cuBLAS; at TP8 the package GEMM, which
-    also publishes the partial into the attention boundary's mailbox)."""
+    also publishes the partial into the attention boundary's mailbox).
+
+    With ``stock_full_attention`` the full-attention layers (no window) run the
+    stock path's decode attention instead of attn2: FlashInfer's TRT-LLM-gen
+    paged decode with the arguments FlashInferImpl passes, then the stock
+    o-norm + sigmoid gate. attn2 reads the KV cache at 1-1.5 TB/s; TRT-LLM-gen
+    takes 31 vs 73 us per layer at 100k context and 60 vs 203 us at 300k (TP4,
+    GB300), but about 10 us at any length, so it is used where the deployment
+    serves long contexts (``STOCK_FULL_ATTENTION_MIN_CONTEXT``). The sliding
+    layers keep attn2 (5 vs 12 us)."""
 
     def __init__(
         self,
@@ -228,6 +240,8 @@ class QkvAttention:
         self.eps = attn.rms_norm_eps
         self.num_kv_heads = attn.num_kv_heads
         self.oproj, self.qkv, self.out, self.partial = oproj, qkv, out, partial
+        self.stock_attention = False
+        self.query: torch.Tensor | None = None
 
     @classmethod
     def unsupported(cls, vllm_config) -> str | None:
@@ -281,7 +295,7 @@ class QkvAttention:
                 workspace = torch.zeros(size, dtype=torch.uint8, device=ctx.device)
                 ctx.buffers["attn2_workspace"] = workspace
             assert workspace.shape == (size,), "attn2_workspace"
-        return cls(
+        provider = cls(
             attn,
             OProjection.build(ctx, layer),
             qkv,
@@ -292,6 +306,86 @@ class QkvAttention:
             num_splits,
             workspace,
         )
+        if ctx.stock_full_attention and window == 0:
+            provider.use_stock_attention(ctx)
+        return provider
+
+    def use_stock_attention(self, ctx: BuildContext) -> None:
+        """Run this full-attention layer's decode on the stock path's kernels."""
+        attn = self.attn
+        if not (attn.fuse_o_norm_gate and attn.cute_o_norm_gate):
+            raise ValueError(
+                f"{self.layer_name}: the stock decode attention needs the stock "
+                "fused o-norm + sigmoid gate"
+            )
+        impl = attn.attn.impl
+        if impl.sinks is not None or impl.cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError(f"{self.layer_name}: unsupported stock decode attention")
+        self.stock_attention = True
+        # The query as FlashInfer takes it: [rows, heads, head_dim], contiguous
+        # (the QKV front leaves q as a column view of its output).
+        self.query = ctx.buffers.get("stock_attention_query")
+        if self.query is None:
+            self.query = torch.empty(
+                PREPARED_MAX,
+                attn.num_heads,
+                attn.head_dim,
+                dtype=torch.bfloat16,
+                device=ctx.device,
+            )
+            ctx.buffers["stock_attention_query"] = self.query
+
+    def stock_decode_attention(
+        self, q: torch.Tensor, gate: torch.Tensor, kv_cache: torch.Tensor, decode
+    ) -> torch.Tensor:
+        """The stock decode of this layer (FlashInferImpl.forward's TRT-LLM-gen
+        call for a uniform 8-token verify step, then MuseSpark1xAttention's
+        fused o-norm + sigmoid gate), written into ``self.out``. ``decode`` is
+        the layer's FlashInferTrtllmAPIDecode metadata."""
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+
+        from vllm.models.muse_spark.nvidia.model import o_norm_sigmoid_gate
+        from vllm.v1.attention.backends.flashinfer import (
+            _get_trtllm_workspace_buffer,
+        )
+
+        from . import csrc_ops
+
+        attn = self.attn
+        impl = attn.attn.impl
+        b = q.shape[0]
+        heads, head_dim = attn.num_heads, attn.head_dim
+        query = self.query[:b]
+        query.copy_(q.view(b, heads, head_dim))
+        out = self.out[:b].view(b, heads, head_dim)
+        bmm1_scale = impl.bmm1_scale if impl.bmm1_scale is not None else impl.scale
+        bmm2_scale = impl.bmm2_scale if impl.bmm2_scale is not None else 1.0
+        trtllm_batch_decode_with_kv_cache(
+            query=query,
+            kv_cache=kv_cache.split(head_dim, dim=-1),
+            workspace_buffer=_get_trtllm_workspace_buffer(),
+            block_tables=decode.block_tables,
+            seq_lens=decode.seq_lens,
+            max_seq_len=decode.max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=-1,
+            out=out,
+            kv_layout="HND",
+            # TRT-LLM-gen even where the stock backend picked XQA for this
+            # layer: it is the kernel measured here (FlashInfer's
+            # trtllm_batch_decode_with_kv_cache runs both).
+            backend="trtllm-gen",
+            q_len_per_req=csrc_ops.QUERY_LEN,
+            multi_ctas_kv_counter_buffer=getattr(
+                impl, "_multi_ctas_kv_counter_buffer", None
+            ),
+        )
+        assert o_norm_sigmoid_gate is not None
+        o_norm_sigmoid_gate(
+            out, gate.reshape(b, heads, head_dim), attn.rms_norm_eps, enable_pdl=True
+        )
+        return self.out[:b]
 
     def prepare_kv(self) -> None:
         from . import csrc_ops
@@ -361,6 +455,9 @@ class QkvAttention:
         )
         q, gate = csrc_ops.split_qkv(qkv, self.num_kv_heads)
         decode = metadata.decode
+        if self.stock_attention:
+            out = self.stock_decode_attention(q, gate, kv_cache, decode)
+            return self.oproj.run(out, self.partial[:b])
         out = self.out[:b]
         csrc_ops.attn2(
             q,
