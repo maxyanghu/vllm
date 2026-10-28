@@ -27,9 +27,8 @@ class DecodeConfig:
     max_context: int
     capture_sizes: tuple[int, ...]
     # The NVFP4 routed experts on the persistent expert kernel
-    # (cutedsl/moe/persistent_experts.py) instead of TRT-LLM-gen's GEMMs, with
-    # the stock EP experts at every TP size (no expert TP). On by default on
-    # SM103; additional_config "persistent_experts": false turns it off.
+    # (cutedsl/moe/persistent_experts.py) instead of TRT-LLM-gen's GEMMs, on
+    # the stock EP experts (no expert TP). See persistent_experts().
     persistent_experts: bool = True
 
 
@@ -61,14 +60,26 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     )
 
 
+# The TP sizes whose NVFP4 experts run the persistent expert kernel by default.
+# At TP8 the expert-TP experts (balanced over the ranks) measured as fast or
+# faster on GB300 (c1 decode step 5.59 / 6.12 / 6.68 ms at 2k / 100k / 300k vs
+# 5.85 / 6.23 / 6.59 with EP8 + the persistent kernel), so TP8 keeps them.
+PERSISTENT_EXPERTS_TPS = (4,)
+
+
 def persistent_experts(vllm_config) -> bool:
     """Whether the NVFP4 routed experts run on the persistent expert kernel:
-    on SM103 unless ``additional_config`` sets ``"persistent_experts": false``.
-    Reads the config only, so every rank agrees."""
+    on SM103 at PERSISTENT_EXPERTS_TPS, or where ``additional_config`` sets
+    ``"persistent_experts"`` (true or false). Reads the config only, so every
+    rank agrees."""
     from vllm.platforms import current_platform
 
+    tp = vllm_config.parallel_config.tensor_parallel_size
     extra = vllm_config.additional_config
-    wanted = extra.get("persistent_experts", True) if isinstance(extra, dict) else True
+    default = tp in PERSISTENT_EXPERTS_TPS
+    wanted = (
+        extra.get("persistent_experts", default) if isinstance(extra, dict) else default
+    )
     if not isinstance(wanted, bool):
         raise ValueError("additional_config persistent_experts must be a bool")
     return wanted and current_platform.is_device_capability(103)

@@ -169,13 +169,20 @@ class SpecializedDecode:
         )
         self.layout = layout = LAYOUTS[self.tp]
         self.build(ctx, layout)
+        tp_experts = any(
+            self.ops.is_expert_tp(layer.layer_idx) for layer in self.layers
+        )
         # Capture-time outcomes already logged; plan() never logs outside capture.
         self.logged: set[str] = set()
         logger.info(
-            "Muse Spark specialized decode built: TP%d, %d layers, aux layers %s",
+            "Muse Spark specialized decode built: TP%d, %d layers, aux layers %s; "
+            "routed experts: %s",
             self.tp,
             len(self.layers),
             self.aux_layers,
+            "persistent kernel"
+            if self.persistent_experts
+            else ("expert TP" if tp_experts else "TRT-LLM-gen EP"),
         )
 
     def build(self, ctx: BuildContext, layout: Layout) -> None:
@@ -199,9 +206,7 @@ class SpecializedDecode:
         self.ops = ops = flashinfer_ops.build(
             get_tp_group(),
             self.layers,
-            use_expert_tp=(
-                tp in policy.EXPERT_TP_TPS and not self.persistent_experts
-            ),
+            use_expert_tp=(tp in policy.EXPERT_TP_TPS and not self.persistent_experts),
             persistent_experts=self.persistent_experts,
         )
         all_reduce = (
