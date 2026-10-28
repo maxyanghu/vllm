@@ -26,6 +26,11 @@ class DecodeConfig:
     q: int
     max_context: int
     capture_sizes: tuple[int, ...]
+    # The NVFP4 routed experts on the persistent expert kernel
+    # (cutedsl/moe/persistent_experts.py) instead of TRT-LLM-gen's GEMMs, with
+    # the stock EP experts at every TP size (no expert TP). On by default on
+    # SM103; additional_config "persistent_experts": false turns it off.
+    persistent_experts: bool = True
 
 
 def decode_backend(vllm_config) -> str:
@@ -52,7 +57,21 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         capture_sizes=tuple(
             vllm_config.compilation_config.cudagraph_capture_sizes or ()
         ),
+        persistent_experts=persistent_experts(vllm_config),
     )
+
+
+def persistent_experts(vllm_config) -> bool:
+    """Whether the NVFP4 routed experts run on the persistent expert kernel:
+    on SM103 unless ``additional_config`` sets ``"persistent_experts": false``.
+    Reads the config only, so every rank agrees."""
+    from vllm.platforms import current_platform
+
+    extra = vllm_config.additional_config
+    wanted = extra.get("persistent_experts", True) if isinstance(extra, dict) else True
+    if not isinstance(wanted, bool):
+        raise ValueError("additional_config persistent_experts must be a bool")
+    return wanted and current_platform.is_device_capability(103)
 
 
 def unsupported(vllm_config) -> str | None:

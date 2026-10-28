@@ -632,9 +632,16 @@ class FlashInferOps:
         # the op's untuned default.
         self.tp_preferred: tuple[tuple[int, int], ...] = ()
         self.tp_tactic: tuple[int, int] | None = None
+        # The NVFP4 layers whose experts run the persistent expert kernel at
+        # up to persistent_experts.MAX_ROWS tokens.
+        self.persistent: set[int] = set()
 
     def build(
-        self, group, layers: tuple[nn.Module, ...], use_expert_tp: bool = False
+        self,
+        group,
+        layers: tuple[nn.Module, ...],
+        use_expert_tp: bool = False,
+        persistent_experts: bool = False,
     ) -> None:
         """``layers``: the stock decoder layers (layer_idx, feed_forward).
 
@@ -661,6 +668,10 @@ class FlashInferOps:
                     f"Layer {layer.layer_idx} runs {type(experts).__name__}, not "
                     "the TRT-LLM-gen experts the specialized decode calls."
                 )
+        if persistent_experts:
+            if use_expert_tp:
+                raise ValueError("The persistent experts serve the EP experts.")
+            self.prepare_persistent()
         seconds = 0.0
         if use_expert_tp:
             # Before the calls below the op are prepared: they bind the
@@ -885,6 +896,81 @@ class FlashInferOps:
             output, do_finalize=False, num_tokens=num_tokens, top_k=TOP_K
         )
 
+    # ------------------------------------------------ persistent expert kernel
+    def prepare_persistent(self) -> None:
+        """Compiles the persistent expert kernel for the NVFP4 layers' window
+        and creates its workspace, before capture. The same on every rank (the
+        window is the EP block size); raises when a layer's shape is not one
+        the kernel serves."""
+        from ..cutedsl.moe import persistent_experts as pe
+
+        for layer, args in self.nvfp4.items():
+            if args["gemm1_alpha"] is not None or args["gemm1_beta"] is not None:
+                raise ValueError("The persistent experts run plain SwiGLU.")
+            if args["gemm1_clamp_limit"] is not None:
+                raise ValueError("The persistent experts run plain SwiGLU.")
+            if not pe.supports(
+                1,
+                args["top_k"],
+                args["gemm2_weights"].shape[1],
+                args["intermediate_size"],
+                args["local_num_experts"],
+            ):
+                raise ValueError(
+                    f"layer {layer}: the persistent expert kernel does not serve "
+                    f"{args['local_num_experts']} local experts of intermediate "
+                    f"size {args['intermediate_size']}."
+                )
+            pe.prepare(*self.persistent_operands(args)[:5])
+            self.persistent.add(layer)
+
+    @staticmethod
+    def persistent_operands(args: dict[str, Any]) -> tuple:
+        return (
+            args["local_expert_offset"],
+            args["gemm1_weights"],
+            args["gemm1_weights_scale"],
+            args["gemm2_weights"],
+            args["gemm2_weights_scale"],
+            args["output1_scale_scalar"],
+            args["output1_scale_gate_scalar"],
+            args["output2_scale_scalar"],
+        )
+
+    def is_persistent(self, layer: int, num_tokens: int) -> bool:
+        from ..cutedsl.moe.persistent_experts import MAX_ROWS
+
+        return layer in self.persistent and num_tokens <= MAX_ROWS
+
+    def persistent_experts(
+        self, layer: int, inputs: ExpertsInput, topk: RoutedTopk
+    ) -> UnfinalizedMoEOutput:
+        """The routed experts on the persistent expert kernel: route-major
+        rows (row t * TOP_K + k for local route (t, k), -1 for remote routes),
+        each bitwise equal to the TRT-LLM-gen op's row for that route."""
+        from ..cutedsl.moe import persistent_experts as pe
+
+        offset, *weights = self.persistent_operands(self.nvfp4[layer])
+        rows, index = pe.persistent_experts(
+            offset,
+            inputs.a,
+            inputs.a_sf,
+            topk.ids,
+            weights[0],
+            weights[1],
+            weights[2],
+            weights[3],
+            weights[4],
+            weights[5],
+            weights[6],
+        )
+        return UnfinalizedMoEOutput(
+            gemm2_permuted=rows,
+            expert_weights=topk.weights,
+            expanded_idx_to_permuted_idx=index,
+            route_major=True,
+        )
+
     def is_expert_tp(self, layer: int) -> bool:
         """Whether the layer's experts are TP (finalized by the TP tail)
         rather than EP (the EP tail)."""
@@ -1015,6 +1101,9 @@ class FlashInferOps:
         prepared for that tactic."""
         from flashinfer.autotuner import AutoTuner
 
+        if self.is_persistent(layer, inputs.a.shape[0]):
+            # No routing metadata: the persistent kernel routes from the ids.
+            return None
         call = self.nvfp4_calls.get(layer)
         if call is None:
             return None
@@ -1055,6 +1144,8 @@ class FlashInferOps:
         these inputs), from the metadata the routing wrote for it."""
         if plan is not None:
             return self.routed_experts_from_metadata(inputs, topk, plan)
+        if self.is_persistent(layer, inputs.a.shape[0]):
+            return self.persistent_experts(layer, inputs, topk)
         return self.public_routed_experts(self.nvfp4[layer], inputs, topk)
 
     def routed_experts_from_metadata(
@@ -1107,10 +1198,18 @@ class FlashInferOps:
 
 
 def build(
-    group, layers: tuple[nn.Module, ...], use_expert_tp: bool = False
+    group,
+    layers: tuple[nn.Module, ...],
+    use_expert_tp: bool = False,
+    persistent_experts: bool = False,
 ) -> FlashInferOps:
     """The routed expert ops for ``layers`` (the stock decoder layers), built
     and warmed up."""
     ops = FlashInferOps()
-    ops.build(group, layers, use_expert_tp=use_expert_tp)
+    ops.build(
+        group,
+        layers,
+        use_expert_tp=use_expert_tp,
+        persistent_experts=persistent_experts,
+    )
     return ops

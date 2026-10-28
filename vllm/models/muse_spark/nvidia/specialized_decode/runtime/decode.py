@@ -139,6 +139,7 @@ class SpecializedDecode:
 
     def __init__(self, backbone: torch.nn.Module, config: DecodeConfig):
         self.backbone, self.q = backbone, config.q
+        self.persistent_experts = config.persistent_experts
         group = get_tp_group()
         self.tp, self.rank = group.world_size, group.rank_in_group
         assert self.tp == config.tp
@@ -192,10 +193,16 @@ class SpecializedDecode:
         self.moe_input = buffer("moe_input", torch.bfloat16)
         self.output = buffer("output", torch.bfloat16)
 
-        # The routed expert ops of every layer (expert TP at
-        # policy.EXPERT_TP_TPS) and, at TP16, the all-reduce.
+        # The routed expert ops of every layer (the persistent expert kernel
+        # when on, else expert TP at policy.EXPERT_TP_TPS) and, at TP16, the
+        # all-reduce.
         self.ops = ops = flashinfer_ops.build(
-            get_tp_group(), self.layers, use_expert_tp=tp in policy.EXPERT_TP_TPS
+            get_tp_group(),
+            self.layers,
+            use_expert_tp=(
+                tp in policy.EXPERT_TP_TPS and not self.persistent_experts
+            ),
+            persistent_experts=self.persistent_experts,
         )
         all_reduce = (
             self.ops.all_reduce if tp in flashinfer_ops.ALL_REDUCE_TPS else None
