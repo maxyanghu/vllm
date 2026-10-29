@@ -603,7 +603,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "muse_spark_qkv_front("
       "Tensor x, Tensor weight, Tensor positions, Tensor? cos_sin_cache, "
-      "Tensor slot_mapping, Tensor! kv_cache, Tensor! out, float eps) -> ()");
+      "Tensor slot_mapping, Tensor! kv_cache, Tensor! out, float eps, "
+      "Tensor? k_scale=None, Tensor? v_scale=None) -> ()");
   // Paged decode attention + output RMS norm + sigmoid gate into out. A
   // max_seq_len above 2048 or a sliding window needs workspace.
   ops.def(

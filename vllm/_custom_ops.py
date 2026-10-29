@@ -2767,13 +2767,25 @@ def muse_spark_qkv_front(
     kv_cache: torch.Tensor,
     out: torch.Tensor,
     eps: float,
+    k_scale: torch.Tensor | None = None,
+    v_scale: torch.Tensor | None = None,
 ) -> None:
     """``out = x @ weight.T`` with the q and k heads RMS-normalized (and rotated
-    when ``cos_sin_cache`` is given); writes the k and v heads to the bf16 paged
-    ``kv_cache`` at ``slot_mapping`` (-1 skips a token). Decode batches of 1 to
-    16 tokens, hidden size 8192, head_dim 64."""
+    when ``cos_sin_cache`` is given); writes the k and v heads to the paged
+    ``kv_cache`` at ``slot_mapping`` (-1 skips a token): bf16, or float8_e4m3fn
+    with per-tensor ``k_scale`` / ``v_scale`` (fp32 [1]). Decode batches of 1
+    to 16 tokens, hidden size 8192, head_dim 64."""
     torch.ops._C.muse_spark_qkv_front(
-        x, weight, positions, cos_sin_cache, slot_mapping, kv_cache, out, eps
+        x,
+        weight,
+        positions,
+        cos_sin_cache,
+        slot_mapping,
+        kv_cache,
+        out,
+        eps,
+        k_scale,
+        v_scale,
     )
 
 
@@ -2858,6 +2870,8 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "muse_spark_qkv_front"):
         kv_cache: torch.Tensor,
         out: torch.Tensor,
         eps: float,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
     ) -> None:
         torch._check(x.dim() == 2 and weight.dim() == 2 and out.dim() == 2)
         torch._check(x.shape[1] == weight.shape[1])

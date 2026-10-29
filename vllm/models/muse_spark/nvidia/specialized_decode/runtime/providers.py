@@ -196,6 +196,12 @@ class RoutedExpertsOps(Protocol):
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor: ...
 
 
+def csrc_ops_fp8_dtypes() -> tuple[str, ...]:
+    from .csrc_ops import FP8_KV_CACHE_DTYPES
+
+    return FP8_KV_CACHE_DTYPES
+
+
 def _scratch(ctx: BuildContext, name: str, shape, dtype) -> torch.Tensor:
     """An executor buffer shared by every layer (allocated once, at build)."""
     buffer = ctx.buffers.get(name)
@@ -244,6 +250,10 @@ class QkvAttention:
         self.num_kv_heads = attn.num_kv_heads
         self.oproj, self.qkv, self.out, self.partial = oproj, qkv, out, partial
         self.stock_attention = False
+        # An fp8 KV cache (full-attention layers only): the QKV front stores
+        # fp8 with the layer's k/v scales, the stock decode reads it.
+        self.cache_dtype = attn.attn.kv_cache_dtype
+        self.kv_fp8 = self.cache_dtype in csrc_ops_fp8_dtypes()
         self.query: torch.Tensor | None = None
         self.fi_workspace: torch.Tensor | None = None
         self.kv_counters: torch.Tensor | None = None
@@ -311,7 +321,15 @@ class QkvAttention:
             num_splits,
             workspace,
         )
-        if ctx.stock_full_attention and window == 0:
+        if provider.kv_fp8 and window != 0:
+            raise ValueError(
+                f"layer {layer.layer_idx}: an fp8 KV cache on a sliding layer "
+                "(attn2 reads bf16; pass --kv-cache-dtype-skip-layers "
+                "sliding_window)"
+            )
+        # attn2 reads bf16 only: an fp8 full-attention layer runs the stock
+        # decode at every length.
+        if (ctx.stock_full_attention or provider.kv_fp8) and window == 0:
             provider.use_stock_attention(ctx)
         return provider
 
@@ -324,7 +342,11 @@ class QkvAttention:
                 "fused o-norm + sigmoid gate"
             )
         impl = attn.attn.impl
-        if impl.sinks is not None or impl.cache_dtype not in ("auto", "bfloat16"):
+        if impl.sinks is not None or impl.cache_dtype not in (
+            "auto",
+            "bfloat16",
+            *csrc_ops_fp8_dtypes(),
+        ):
             raise ValueError(f"{self.layer_name}: unsupported stock decode attention")
         counters = getattr(impl, "_multi_ctas_kv_counter_buffer", None)
         if counters is None:
@@ -355,6 +377,19 @@ class QkvAttention:
                 device=ctx.device,
             )
             ctx.buffers["stock_attention_query"] = self.query
+        if self.kv_fp8:
+            # The fp8 query FlashInferImpl decodes with on an fp8 cache
+            # (get_q_data_type on SM100: the cache's fp8 dtype).
+            self.query_fp8 = ctx.buffers.get("stock_attention_query_fp8")
+            if self.query_fp8 is None:
+                self.query_fp8 = torch.empty(
+                    PREPARED_MAX,
+                    attn.num_heads,
+                    attn.head_dim,
+                    dtype=torch.float8_e4m3fn,
+                    device=ctx.device,
+                )
+                ctx.buffers["stock_attention_query_fp8"] = self.query_fp8
 
     def stock_decode_attention(
         self, q: torch.Tensor, gate: torch.Tensor, kv_cache: torch.Tensor, decode
@@ -374,11 +409,27 @@ class QkvAttention:
         impl = attn.attn.impl
         b = q.shape[0]
         heads, head_dim = attn.num_heads, attn.head_dim
-        query = self.query[:b]
-        query.copy_(q.view(b, heads, head_dim))
         out = self.out[:b].view(b, heads, head_dim)
-        bmm1_scale = impl.bmm1_scale if impl.bmm1_scale is not None else impl.scale
-        bmm2_scale = impl.bmm2_scale if impl.bmm2_scale is not None else 1.0
+        if self.kv_fp8:
+            # FlashInferImpl on an fp8 cache: the query statically quantized
+            # with the layer's q scale, bmm1 = scale * q_scale * k_scale,
+            # bmm2 = v_scale.
+            from vllm import _custom_ops as ops
+
+            layer = attn.attn
+            query = self.query_fp8[:b]
+            ops.scaled_fp8_quant(
+                q.reshape(b, heads * head_dim),
+                scale=layer._q_scale,
+                output=query.view(b, heads * head_dim),
+            )
+            bmm1_scale = impl.scale * layer._q_scale_float * layer._k_scale_float
+            bmm2_scale = layer._v_scale_float
+        else:
+            query = self.query[:b]
+            query.copy_(q.view(b, heads, head_dim))
+            bmm1_scale = impl.bmm1_scale if impl.bmm1_scale is not None else impl.scale
+            bmm2_scale = impl.bmm2_scale if impl.bmm2_scale is not None else 1.0
         trtllm_batch_decode_with_kv_cache(
             query=query,
             kv_cache=tuple(
@@ -413,6 +464,7 @@ class QkvAttention:
         kv_cache = self.attn.attn.kv_cache
         if not isinstance(kv_cache, torch.Tensor) or kv_cache.numel() == 0:
             return
+        kv_cache = csrc_ops.kv_cache_view(kv_cache, self.cache_dtype)
         if not csrc_ops.kv_cache_layout_ok(kv_cache, self.num_kv_heads):
             raise ValueError(
                 f"{self.layer_name}: KV cache {tuple(kv_cache.shape)} "
@@ -461,6 +513,7 @@ class QkvAttention:
         from . import csrc_ops
 
         _, _, kv_cache, slot_mapping = get_attention_context(self.layer_name)
+        kv_cache = csrc_ops.kv_cache_view(kv_cache, self.cache_dtype)
         if slot_mapping is None or not csrc_ops.supports_call(
             x,
             self.weight,
@@ -497,6 +550,11 @@ class QkvAttention:
             kv_cache,
             qkv,
             self.eps,
+            *(
+                (self.attn.attn._k_scale, self.attn.attn._v_scale)
+                if self.kv_fp8
+                else ()
+            ),
         )
         q, gate = csrc_ops.split_qkv(qkv, self.num_kv_heads)
         decode = metadata.decode

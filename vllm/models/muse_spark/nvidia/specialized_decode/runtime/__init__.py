@@ -256,7 +256,20 @@ def unsupported(vllm_config) -> str | None:
             not in (None, getattr(draft, "vocab_size", None)),
             "a reduced DSpark draft vocabulary",
         ),
-        (kv_dtype not in ("bfloat16", torch.bfloat16), "KV cache dtypes but BF16"),
+        # BF16, or an fp8 (e4m3) cache on the full-attention layers only: the
+        # sliding layers (and the DSpark draft's, all sliding) stay BF16 for
+        # attn2 and the draft's fused stores.
+        (
+            kv_dtype not in ("bfloat16", torch.bfloat16)
+            and not (
+                kv_dtype in ("fp8", "fp8_e4m3")
+                and "sliding_window" in cache.kv_cache_dtype_skip_layers
+            ),
+            (
+                "KV cache dtypes but BF16 or fp8_e4m3 with "
+                "--kv-cache-dtype-skip-layers sliding_window"
+            ),
+        ),
         (cache.block_size != 16, "KV cache block sizes but 16"),
         (vllm_config.kv_transfer_config is not None, "KV transfer"),
         (envs.VLLM_BATCH_INVARIANT, "batch-invariant mode"),

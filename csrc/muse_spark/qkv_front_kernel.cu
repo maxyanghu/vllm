@@ -30,6 +30,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 
 #include <map>
@@ -211,13 +212,36 @@ __device__ __forceinline__ int k_tile(int i, int rank) {
   return ((i / KSTRIPE) * (S * KSTRIPE) + rank * KSTRIPE + i % KSTRIPE) * KT;
 }
 
-// kv_cache row of `slot` for kv head `kvh` (64-bit index math: cache offsets
-// exceed 2^31).
-__device__ __forceinline__ __nv_bfloat16* cache_row(__nv_bfloat16* cache,
+// The KV cache's element type: bf16, or fp8 e4m3 with per-tensor scales
+// (k_scale non-null). The fp8 store quantizes the bf16-rounded value times
+// 1 / scale, saturating, as the stock fused_muse_spark_qknorm_rope_kv_insert
+// does for an fp8_e4m3 cache.
+struct KvStore {
+  const float* k_scale;  // [1] or nullptr (bf16 cache)
+  const float* v_scale;  // [1] or nullptr
+};
+
+// Byte address of the kv_cache row of `slot` for kv head `kvh` (64-bit index
+// math: cache offsets exceed 2^31); esz = cache element bytes (2 or 1).
+__device__ __forceinline__ unsigned char* cache_row(unsigned char* cache,
                                                     long long slot, int HKV,
-                                                    int kvh) {
-  return cache +
-         (((slot >> 4) * HKV + kvh) * 16 + (slot & 15)) * (int64_t)(2 * D);
+                                                    int kvh, int esz) {
+  return cache + (((slot >> 4) * HKV + kvh) * 16 + (slot & 15)) *
+                     (int64_t)(2 * D) * esz;
+}
+
+// One lane's two cache elements (dims 2 lane, 2 lane + 1) at row + col.
+__device__ __forceinline__ void store_kv2(unsigned char* row, int col, int lane,
+                                          __nv_bfloat162 v, const float* scale) {
+  if (scale == nullptr) {
+    reinterpret_cast<__nv_bfloat162*>(row + 2 * col)[lane] = v;
+  } else {
+    const float inv = 1.0f / *scale;
+    const float2 f =
+        make_float2(__low2float(v) * inv, __high2float(v) * inv);
+    reinterpret_cast<__nv_fp8x2_storage_t*>(row + col)[lane] =
+        __nv_cvt_float2_to_fp8x2(f, __NV_SATFINITE, __NV_E4M3);
+  }
 }
 
 // Epilogue for one (token, head): sum the S split-K partials in rank order,
@@ -229,7 +253,9 @@ __device__ __forceinline__ void finish_token(const float* rp, int rstride,
                                              int rope, int head, int HQ,
                                              int HKV, float eps,
                                              __nv_bfloat16* yrow,
-                                             __nv_bfloat16* cache) {
+                                             unsigned char* cache,
+                                             KvStore kvs) {
+  const int esz = kvs.k_scale == nullptr ? 2 : 1;
   const int lane = threadIdx.x & 31;
   const int grpB = HQ, grpC = HQ + HKV, grpD = HQ + 2 * HKV;
   float2 p[S];
@@ -259,11 +285,11 @@ __device__ __forceinline__ void finish_token(const float* rp, int rstride,
     }
     outv = __floats2bfloat162_rn(o0, o1);
     if (head >= grpB && slot >= 0)
-      reinterpret_cast<__nv_bfloat162*>(
-          cache_row(cache, slot, HKV, head - grpB))[lane] = outv;
+      store_kv2(cache_row(cache, slot, HKV, head - grpB, esz), 0, lane, outv,
+                kvs.k_scale);
   } else if (head < grpD && slot >= 0) {
-    reinterpret_cast<__nv_bfloat162*>(cache_row(cache, slot, HKV, head - grpC) +
-                                      D)[lane] = yb;
+    store_kv2(cache_row(cache, slot, HKV, head - grpC, esz), D, lane, yb,
+              kvs.v_scale);
   }
   reinterpret_cast<__nv_bfloat162*>(yrow)[lane] = outv;
 }
@@ -279,9 +305,9 @@ __global__ void __launch_bounds__(NTHREADS, 2)
                      const int64_t* __restrict__ positions,
                      const float* __restrict__ cos_sin,
                      const int64_t* __restrict__ slots,
-                     __nv_bfloat16* __restrict__ cache,
+                     unsigned char* __restrict__ cache,
                      __nv_bfloat16* __restrict__ y, int M, int N, int HQ,
-                     int HKV, int rope, float eps) {
+                     int HKV, int rope, float eps, KvStore kvs) {
   using C = Cfg<NT, STAGES>;
   constexpr int MAX_OWNED = (8 * NT + S - 1) / S;
   constexpr int MAX_RECV = S * MAX_OWNED;
@@ -362,9 +388,10 @@ __global__ void __launch_bounds__(NTHREADS, 2)
       s_slot[lane] = sl;
       prefetch_l2(y + (size_t)(rank + lane * S) * N + row0);
       if (sl >= 0 && head >= grpB && head < grpD)
-        prefetch_l2(
-            cache_row(cache, sl, HKV, head < grpC ? head - grpB : head - grpC) +
-            (head < grpC ? 0 : D));
+        prefetch_l2(cache_row(cache, sl, HKV,
+                              head < grpC ? head - grpB : head - grpC,
+                              kvs.k_scale == nullptr ? 2 : 1) +
+                    (head < grpC ? 0 : D) * (kvs.k_scale == nullptr ? 2 : 1));
     }
     if (rope && head < grpC) {
       if (lane < ntok) pos = positions[rank + lane * S];
@@ -526,7 +553,8 @@ __global__ void __launch_bounds__(NTHREADS, 2)
     const bool first = u == warp;
     finish_token<S>(&s_recv[u][0], ntok_max * D, first ? cv0 : s_cs[u][lane],
                     first ? sn0 : s_cs[u][32 + lane], first ? slot0 : s_slot[u],
-                    rope, head, HQ, HKV, eps, y + (size_t)tk * N + row0, cache);
+                    rope, head, HQ, HKV, eps, y + (size_t)tk * N + row0, cache,
+                    kvs);
   }
   cluster_wait();
 }
@@ -630,7 +658,7 @@ template <int NT, int STAGES, int S, int FIXED_M>
 void launch_cfg(int device, const CUtensorMap& tm_w, const void* x,
                 const int64_t* pos, const float* cs, const int64_t* slots,
                 void* cache, void* y, int M, int N, int HQ, int HKV, int rope,
-                float eps, cudaStream_t stream) {
+                float eps, KvStore kvs, cudaStream_t stream) {
   using C = Cfg<NT, STAGES>;
   auto kern = qkv_fused_kernel<NT, STAGES, S, FIXED_M>;
   {
@@ -664,9 +692,9 @@ void launch_cfg(int device, const CUtensorMap& tm_w, const void* x,
   cfg.attrs = attr;
   cfg.numAttrs = 2;
   check_cuda(cudaLaunchKernelEx(&cfg, kern, tm_w, tm_x, pos, cs, slots,
-                                reinterpret_cast<__nv_bfloat16*>(cache),
+                                reinterpret_cast<unsigned char*>(cache),
                                 reinterpret_cast<__nv_bfloat16*>(y), M, N, HQ,
-                                HKV, rope, eps),
+                                HKV, rope, eps, kvs),
              "fused_muse_spark_qkv_qknorm_rope_kv_insert launch");
 }
 
@@ -674,20 +702,20 @@ template <int NT, int FIXED_M>
 void launch_nt(int S, int stages, int device, const CUtensorMap& tm_w,
                const void* x, const int64_t* pos, const float* cs,
                const int64_t* slots, void* cache, void* y, int M, int N, int HQ,
-               int HKV, int rope, float eps, cudaStream_t stream) {
+               int HKV, int rope, float eps, KvStore kvs, cudaStream_t stream) {
   if (S == 2 && stages == kStages) {
     launch_cfg<NT, kStages, 2, FIXED_M>(device, tm_w, x, pos, cs, slots, cache,
-                                        y, M, N, HQ, HKV, rope, eps, stream);
+                                        y, M, N, HQ, HKV, rope, eps, kvs, stream);
   } else if (S == 4 && stages == kStages) {
     launch_cfg<NT, kStages, 4, FIXED_M>(device, tm_w, x, pos, cs, slots, cache,
-                                        y, M, N, HQ, HKV, rope, eps, stream);
+                                        y, M, N, HQ, HKV, rope, eps, kvs, stream);
   } else if (S == 4 && stages == kStagesDeep) {
     launch_cfg<NT, kStagesDeep, 4, FIXED_M>(device, tm_w, x, pos, cs, slots,
                                             cache, y, M, N, HQ, HKV, rope, eps,
-                                            stream);
+                                            kvs, stream);
   } else if (S == 8 && stages == kStages) {
     launch_cfg<NT, kStages, 8, FIXED_M>(device, tm_w, x, pos, cs, slots, cache,
-                                        y, M, N, HQ, HKV, rope, eps, stream);
+                                        y, M, N, HQ, HKV, rope, eps, kvs, stream);
   } else {
     STD_TORCH_CHECK(false, "no kernel for N = ", N, " (split ", S, ", ", stages,
                     " stages)");
@@ -714,7 +742,9 @@ void fused_muse_spark_qkv_qknorm_rope_kv_insert(
     torch::stable::Tensor const& positions,
     std::optional<torch::stable::Tensor> cos_sin_cache,
     torch::stable::Tensor const& slot_mapping, torch::stable::Tensor& kv_cache,
-    torch::stable::Tensor& out, double eps) {
+    torch::stable::Tensor& out, double eps,
+    std::optional<torch::stable::Tensor> k_scale,
+    std::optional<torch::stable::Tensor> v_scale) {
   using namespace vllm::muse_spark_qkv;
   using torch::headeronly::ScalarType;
   STD_TORCH_CHECK(x.is_cuda(), "x must be a CUDA tensor");
@@ -758,10 +788,24 @@ void fused_muse_spark_qkv_qknorm_rope_kv_insert(
         "cos_sin_cache must be a contiguous fp32 [P, ", D,
         "] tensor on x's device");
   }
-  STD_TORCH_CHECK(kv_cache.scalar_type() == ScalarType::BFloat16 &&
+  // An fp8 cache comes with its per-tensor scales; a bf16 one with none.
+  const bool fp8 = kv_cache.scalar_type() == ScalarType::Float8_e4m3fn;
+  STD_TORCH_CHECK((fp8 || kv_cache.scalar_type() == ScalarType::BFloat16) &&
                       kv_cache.size(2) == 16 && kv_cache.size(3) == 2 * D,
-                  "kv_cache must be a bf16 [pages, HKV, 16, ", 2 * D,
-                  "] tensor");
+                  "kv_cache must be a bf16 or fp8_e4m3 [pages, HKV, 16, ",
+                  2 * D, "] tensor");
+  STD_TORCH_CHECK(k_scale.has_value() == fp8 && v_scale.has_value() == fp8,
+                  "k_scale and v_scale go with an fp8 kv_cache, and only");
+  KvStore kvs{nullptr, nullptr};
+  if (fp8) {
+    for (const auto* t : {&*k_scale, &*v_scale}) {
+      STD_TORCH_CHECK(t->scalar_type() == ScalarType::Float &&
+                          t->numel() == 1 && on_device(*t, dev),
+                      "k_scale / v_scale must be fp32 [1] on x's device");
+    }
+    kvs.k_scale = static_cast<const float*>(k_scale->data_ptr());
+    kvs.v_scale = static_cast<const float*>(v_scale->data_ptr());
+  }
   STD_TORCH_CHECK(kv_cache.stride(0) == (int64_t)HKV * 16 * 2 * D &&
                       (HKV == 1 || kv_cache.stride(1) == 16 * 2 * D) &&
                       kv_cache.stride(2) == 2 * D && kv_cache.stride(3) == 1 &&
@@ -789,12 +833,12 @@ void fused_muse_spark_qkv_qknorm_rope_kv_insert(
   const int stages = ring_stages(N, S);
   if (M == 8) {
     launch_nt<1, 8>(S, stages, dev, tm_w, x.data_ptr(), pos, cs, slots, cache,
-                    y, M, N, HQ, HKV, rope, e, stream);
+                    y, M, N, HQ, HKV, rope, e, kvs, stream);
   } else if (M < 8) {
     launch_nt<1, 0>(S, stages, dev, tm_w, x.data_ptr(), pos, cs, slots, cache,
-                    y, M, N, HQ, HKV, rope, e, stream);
+                    y, M, N, HQ, HKV, rope, e, kvs, stream);
   } else {
     launch_nt<2, 0>(S, stages, dev, tm_w, x.data_ptr(), pos, cs, slots, cache,
-                    y, M, N, HQ, HKV, rope, e, stream);
+                    y, M, N, HQ, HKV, rope, e, kvs, stream);
   }
 }

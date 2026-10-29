@@ -411,13 +411,27 @@ def _matrix_ok(t: torch.Tensor, rows: int) -> bool:
     )
 
 
+# The KV cache dtypes of an fp8 cache as vLLM stores it (uint8) and as the
+# kernels take it.
+FP8_KV_CACHE_DTYPES = ("fp8", "fp8_e4m3")
+
+
+def kv_cache_view(kv_cache: torch.Tensor, cache_dtype: str) -> torch.Tensor:
+    """The layer's KV cache as the kernels take it: an fp8 cache (vLLM's uint8
+    storage) as float8_e4m3fn, a bf16 one as is."""
+    if cache_dtype in FP8_KV_CACHE_DTYPES and kv_cache.dtype == torch.uint8:
+        return kv_cache.view(torch.float8_e4m3fn)
+    return kv_cache
+
+
 def kv_cache_layout_ok(kv_cache: torch.Tensor, num_kv_heads: int) -> bool:
-    """Whether a KV cache has the layout the QKV front and attn2 read: bf16
+    """Whether a KV cache has the layout the QKV front and attn2 read:
     ``[pages, num_kv_heads, 16, 128]`` (K | V per slot), dense pages of dense
-    heads, 16-byte aligned."""
+    heads, 16-byte aligned; bf16 (both) or float8_e4m3fn (the QKV front
+    only; attn2 refuses it)."""
     row = 2 * HEAD_DIM
     if (
-        kv_cache.dtype != torch.bfloat16
+        kv_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
         or kv_cache.dim() != 4
         or tuple(kv_cache.shape[1:]) != (num_kv_heads, BLOCK_SIZE, row)
     ):

@@ -505,7 +505,9 @@ void fused_muse_spark_qkv_qknorm_rope_kv_insert(
     torch::stable::Tensor const& positions,
     std::optional<torch::stable::Tensor> cos_sin_cache,
     torch::stable::Tensor const& slot_mapping, torch::stable::Tensor& kv_cache,
-    torch::stable::Tensor& out, double eps);
+    torch::stable::Tensor& out, double eps,
+    std::optional<torch::stable::Tensor> k_scale,
+    std::optional<torch::stable::Tensor> v_scale);
 // Paged decode attention + output norm + sigmoid gate (8-token verify).
 void muse_spark_attn2(torch::stable::Tensor const& q,
                       torch::stable::Tensor const& kv_cache,
