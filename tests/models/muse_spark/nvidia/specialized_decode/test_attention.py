@@ -114,6 +114,7 @@ def test_full_attention_decode(kv_heads, length):
         attn=SimpleNamespace(impl=impl),
     )
     provider.max_context = MAX_LEN
+    provider.kv_fp8 = False
     provider.query = torch.empty(16, heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
     provider.out = torch.empty(16, width, dtype=torch.bfloat16, device=dev)
     provider.fi_workspace = _get_trtllm_workspace_buffer()
