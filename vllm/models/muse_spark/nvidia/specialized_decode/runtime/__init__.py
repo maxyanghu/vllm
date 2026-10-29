@@ -66,18 +66,28 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
 
 
 # max_model_len from which the full-attention layers run the stock path's
-# TRT-LLM-gen decode by default: it is slower than attn2 below about 16k keys
-# (about 10 us per layer at any length) and 2.4-3.4x faster from 100k up.
-STOCK_FULL_ATTENTION_MIN_CONTEXT = 32768
+# TRT-LLM-gen decode by default, per TP size. The kernel is fixed per captured
+# graph (the runner keys graphs by token count only; a per-step choice through
+# CUDA graph conditional nodes costs ~9 us per node, ~0.28 ms per step, more
+# than it saves). 16 full layers in one graph on GB300, us per step, attn2 vs
+# TRT-LLM-gen: TP4 16k 275 / 292, 32k 435 / 327, 100k 1174 / 523; TP8 32k
+# 278 / 358, 100k 646 / 427 (TRT-LLM-gen ~190 at 2k at both, attn2 61-71). So
+# the switch sits above the crossover (TP4 ~17k keys, TP8 ~45k); TP16 (one KV
+# head per rank) is unmeasured and keeps attn2.
+STOCK_FULL_ATTENTION_MIN_CONTEXT = {4: 32768, 8: 65536}
 
 
 def stock_full_attention(vllm_config) -> bool:
     """Whether the full-attention layers run the stock decode attention: when
-    max_model_len is at least STOCK_FULL_ATTENTION_MIN_CONTEXT, or as
-    ``additional_config`` sets ``"stock_full_attention"`` (true or false).
-    Reads the config only, so every rank agrees."""
+    max_model_len is at least STOCK_FULL_ATTENTION_MIN_CONTEXT for the TP
+    size, or as ``additional_config`` sets ``"stock_full_attention"`` (true
+    or false). Reads the config only, so every rank agrees."""
     extra = vllm_config.additional_config
-    default = vllm_config.model_config.max_model_len >= STOCK_FULL_ATTENTION_MIN_CONTEXT
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    threshold = STOCK_FULL_ATTENTION_MIN_CONTEXT.get(tp)
+    default = (
+        threshold is not None and vllm_config.model_config.max_model_len >= threshold
+    )
     wanted = (
         extra.get("stock_full_attention", default)
         if isinstance(extra, dict)

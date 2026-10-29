@@ -216,8 +216,8 @@ class QkvAttention:
     o-norm + sigmoid gate. attn2 reads the KV cache at 1-1.5 TB/s; TRT-LLM-gen
     takes 31 vs 73 us per layer at 100k context and 60 vs 203 us at 300k (TP4,
     GB300), but about 10 us at any length, so it is used where the deployment
-    serves long contexts (``STOCK_FULL_ATTENTION_MIN_CONTEXT``). The sliding
-    layers keep attn2 (5 vs 12 us)."""
+    serves long contexts (``STOCK_FULL_ATTENTION_MIN_CONTEXT``, per TP size).
+    The sliding layers keep attn2 (5 vs 12 us)."""
 
     def __init__(
         self,
