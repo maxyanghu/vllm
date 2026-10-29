@@ -635,6 +635,12 @@ class FlashInferOps:
         # The NVFP4 layers whose experts run the persistent expert kernel at
         # up to persistent_experts.MAX_ROWS tokens.
         self.persistent: set[int] = set()
+        # Expert replicas (replicas.py): per persistent NVFP4 layer,
+        # the window operands (offset 0, the L + R expert tensors and scalars)
+        # and this rank's window-local id buffer.
+        self.windows: dict[int, tuple] = {}
+        self.window_ids: torch.Tensor | None = None
+        self.rank, self.world = 0, 1
 
     def build(
         self,
@@ -642,6 +648,7 @@ class FlashInferOps:
         layers: tuple[nn.Module, ...],
         use_expert_tp: bool = False,
         persistent_experts: bool = False,
+        expert_replicas: bool = False,
     ) -> None:
         """``layers``: the stock decoder layers (layer_idx, feed_forward).
 
@@ -668,9 +675,13 @@ class FlashInferOps:
                     f"Layer {layer.layer_idx} runs {type(experts).__name__}, not "
                     "the TRT-LLM-gen experts the specialized decode calls."
                 )
+        if expert_replicas and not persistent_experts:
+            raise ValueError("Expert replicas need the persistent experts.")
         if persistent_experts:
             if use_expert_tp:
                 raise ValueError("The persistent experts serve the EP experts.")
+            if expert_replicas:
+                self.extend_windows(tp, layers)
             self.prepare_persistent()
         seconds = 0.0
         if use_expert_tp:
@@ -909,19 +920,20 @@ class FlashInferOps:
                 raise ValueError("The persistent experts run plain SwiGLU.")
             if args["gemm1_clamp_limit"] is not None:
                 raise ValueError("The persistent experts run plain SwiGLU.")
+            operands = self.persistent_operands_of(layer)
             if not pe.supports(
                 1,
                 args["top_k"],
                 args["gemm2_weights"].shape[1],
                 args["intermediate_size"],
-                args["local_num_experts"],
+                operands[1].shape[0],
             ):
                 raise ValueError(
                     f"layer {layer}: the persistent expert kernel does not serve "
                     f"{args['local_num_experts']} local experts of intermediate "
                     f"size {args['intermediate_size']}."
                 )
-            pe.prepare(*self.persistent_operands(args)[:5])
+            pe.prepare(*operands[:5])
             self.persistent.add(layer)
 
     @staticmethod
@@ -937,6 +949,108 @@ class FlashInferOps:
             args["output2_scale_scalar"],
         )
 
+    def persistent_operands_of(self, layer: int) -> tuple:
+        """The persistent kernel's operands of an NVFP4 layer: its window's
+        when it has replicas, else the stock experts' (offset = EP rank x L)."""
+        window = self.windows.get(layer)
+        if window is not None:
+            return window
+        return self.persistent_operands(self.nvfp4[layer])
+
+    def extend_windows(self, tp, layers: tuple[nn.Module, ...]) -> None:
+        """Every NVFP4 layer's window of its experts plus the next rank's first
+        ``REPLICAS`` (``replicas.extend_window``; collective), with the
+        stock layer's parameters re-pointed at the window's own experts, so
+        the replicas are the only new memory. Raises if the stock tensors stay
+        referenced elsewhere (the window would double the experts)."""
+        from . import replicas as er
+
+        self.rank, self.world = tp.rank_in_group, tp.world_size
+        device = None
+        for layer in layers:
+            index = layer.layer_idx
+            if index not in self.nvfp4:
+                continue
+            experts, routed = stock_experts(layer.feed_forward)
+            quant = experts.quant_config
+            if (
+                quant.w1_scale is not routed.w13_weight_scale
+                or quant.w2_scale is not routed.w2_weight_scale
+            ):
+                raise RuntimeError(
+                    "Expert replicas: the stock quant config does not hold the "
+                    "layer's scale parameters."
+                )
+            local = self.nvfp4[index]["local_num_experts"]
+            params = (
+                routed.w13_weight,
+                routed.w13_weight_scale,
+                routed.w2_weight,
+                routed.w2_weight_scale,
+            )
+            device = params[0].device
+            torch.accelerator.synchronize(device)
+            before = torch.cuda.memory_allocated(device)
+            windows = er.extend_window(tuple(p.data for p in params), tp.device_group)
+            scalars = er.extend_window(
+                (experts.g1_scale_c, quant.g1_alphas, quant.g2_alphas),
+                tp.device_group,
+            )
+            for param, window in zip(params, windows):
+                param.data = window[:local]
+            # The arguments again, on the re-pointed parameters (the old ones
+            # hold views of the replaced tensors).
+            self.nvfp4[index] = nvfp4_arguments(experts, routed)
+            w13, w13_sf, w2, w2_sf = windows
+            self.windows[index] = (
+                0,
+                w13,
+                w13_sf.view(torch.float8_e4m3fn),
+                w2,
+                w2_sf.view(torch.float8_e4m3fn),
+                *scalars,
+            )
+            torch.accelerator.synchronize(device)
+            grown = torch.cuda.memory_allocated(device) - before
+            replica_bytes = sum(
+                w[local:].numel() * w.element_size() for w in (*windows, *scalars)
+            )
+            if grown > 1.25 * replica_bytes + (64 << 20):
+                raise RuntimeError(
+                    f"Expert replicas: layer {index} grew {grown} bytes for "
+                    f"{replica_bytes} bytes of replicas; the stock experts are "
+                    "still referenced."
+                )
+        if device is not None:
+            self.window_ids = torch.full(
+                (BATCHES[0], TOP_K), -1, dtype=torch.int32, device=device
+            )
+        logger.info(
+            "Muse Spark expert replicas: %d per rank on %d NVFP4 layers "
+            "(window %d experts, ring placement)",
+            er.REPLICAS,
+            len(self.windows),
+            next(iter(self.windows.values()))[1].shape[0] if self.windows else 0,
+        )
+
+    def has_replicas(self, layer: int) -> bool:
+        return layer in self.windows
+
+    def assign_replicas(self, layer: int, ids: torch.Tensor) -> torch.Tensor | None:
+        """This rank's window-local ids of the routes ``ids`` on a replica
+        layer (written to a buffer the next persistent launch reads; run it on
+        the stream that the experts' launch follows), else None."""
+        from . import replicas as er
+
+        window = self.windows.get(layer)
+        if window is None or ids.shape[0] > BATCHES[0]:
+            return None
+        assert self.window_ids is not None
+        out = self.window_ids[: ids.shape[0]]
+        local = self.nvfp4[layer]["local_num_experts"]
+        er.assign(ids, out, self.rank, self.world, local)
+        return out
+
     def is_persistent(self, layer: int, num_tokens: int) -> bool:
         from ..cutedsl.moe.persistent_experts import MAX_ROWS
 
@@ -950,12 +1064,19 @@ class FlashInferOps:
         each bitwise equal to the TRT-LLM-gen op's row for that route."""
         from ..cutedsl.moe import persistent_experts as pe
 
-        offset, *weights = self.persistent_operands(self.nvfp4[layer])
+        offset, *weights = self.persistent_operands_of(layer)
+        ids = topk.ids
+        if layer in self.windows:
+            # Window-local ids: assigned on the routing's stream when the
+            # caller did (RoutedTopk.local_ids), else here.
+            ids = topk.local_ids
+            if ids is None:
+                ids = self.assign_replicas(layer, topk.ids)
         rows, index = pe.persistent_experts(
             offset,
             inputs.a,
             inputs.a_sf,
-            topk.ids,
+            ids,
             weights[0],
             weights[1],
             weights[2],
@@ -1202,6 +1323,7 @@ def build(
     layers: tuple[nn.Module, ...],
     use_expert_tp: bool = False,
     persistent_experts: bool = False,
+    expert_replicas: bool = False,
 ) -> FlashInferOps:
     """The routed expert ops for ``layers`` (the stock decoder layers), built
     and warmed up."""
@@ -1211,5 +1333,6 @@ def build(
         layers,
         use_expert_tp=use_expert_tp,
         persistent_experts=persistent_experts,
+        expert_replicas=expert_replicas,
     )
     return ops

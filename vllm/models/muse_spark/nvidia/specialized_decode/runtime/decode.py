@@ -140,6 +140,7 @@ class SpecializedDecode:
     def __init__(self, backbone: torch.nn.Module, config: DecodeConfig):
         self.backbone, self.q = backbone, config.q
         self.persistent_experts = config.persistent_experts
+        self.expert_replicas = config.expert_replicas
         group = get_tp_group()
         self.tp, self.rank = group.world_size, group.rank_in_group
         assert self.tp == config.tp
@@ -181,7 +182,11 @@ class SpecializedDecode:
             self.tp,
             len(self.layers),
             self.aux_layers,
-            "persistent kernel"
+            (
+                "persistent kernel + replicas"
+                if self.expert_replicas
+                else "persistent kernel"
+            )
             if self.persistent_experts
             else ("expert TP" if tp_experts else "TRT-LLM-gen EP"),
             "stock TRT-LLM-gen" if config.stock_full_attention else "attn2",
@@ -210,6 +215,7 @@ class SpecializedDecode:
             self.layers,
             use_expert_tp=(tp in policy.EXPERT_TP_TPS and not self.persistent_experts),
             persistent_experts=self.persistent_experts,
+            expert_replicas=self.expert_replicas,
         )
         all_reduce = (
             self.ops.all_reduce if tp in flashinfer_ops.ALL_REDUCE_TPS else None

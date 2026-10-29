@@ -34,6 +34,10 @@ class DecodeConfig:
     # TRT-LLM-gen decode + o-norm/gate instead of attn2. See
     # stock_full_attention().
     stock_full_attention: bool = False
+    # REPLICAS replicas of the next EP rank's experts on every rank's
+    # persistent expert kernel, each step routing an expert to the less loaded
+    # of its ranks. See expert_replicas().
+    expert_replicas: bool = False
 
 
 def decode_backend(vllm_config) -> str:
@@ -62,6 +66,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         ),
         persistent_experts=persistent_experts(vllm_config),
         stock_full_attention=stock_full_attention(vllm_config),
+        expert_replicas=expert_replicas(vllm_config),
     )
 
 
@@ -121,6 +126,21 @@ def persistent_experts(vllm_config) -> bool:
     if not isinstance(wanted, bool):
         raise ValueError("additional_config persistent_experts must be a bool")
     return wanted and current_platform.is_device_capability(103)
+
+
+def expert_replicas(vllm_config) -> bool:
+    """Whether the persistent expert kernel runs a window of the rank's experts
+    plus replicas of the next rank's (runtime/replicas.py), as
+    ``additional_config`` ``"expert_replicas"`` sets it (off by default). Needs
+    the persistent experts; costs REPLICAS experts of memory per NVFP4 layer
+    and rank. Reads the config only, so every rank agrees."""
+    extra = vllm_config.additional_config
+    wanted = extra.get("expert_replicas", False) if isinstance(extra, dict) else False
+    if not isinstance(wanted, bool):
+        raise ValueError("additional_config expert_replicas must be a bool")
+    if wanted and not persistent_experts(vllm_config):
+        raise ValueError("additional_config expert_replicas needs persistent_experts")
+    return wanted
 
 
 def unsupported(vllm_config) -> str | None:

@@ -144,6 +144,9 @@ class RoutedTopk(NamedTuple):
     ids: torch.Tensor
     # float32 [b, TOP_K]
     weights: torch.Tensor
+    # With expert replicas: this rank's window-local ids of the routes
+    # (FlashInferOps.assign_replicas), when the caller assigned them.
+    local_ids: torch.Tensor | None = None
 
 
 class ExpertsInput(NamedTuple):
@@ -697,7 +700,14 @@ class RoutedMoE:
                     topk.weights,
                     None if plan is None else plan.metadata,
                 )
+                # Expert replicas: the routes' ranks, beside the pooler.
+                local_ids = (
+                    self.ops.assign_replicas(self.index, topk.ids)
+                    if plan is None
+                    else None
+                )
                 self.routed.record()
+            topk = topk._replace(local_ids=local_ids)
             self.routed.wait()
             experts = self.ops.routed_experts(self.index, inputs, topk, plan)
         moe_out = self.moe_out[:b]
