@@ -128,19 +128,30 @@ def persistent_experts(vllm_config) -> bool:
     return wanted and current_platform.is_device_capability(103)
 
 
+# The TP sizes whose persistent expert kernel runs with replicas by default
+# (with the persistent experts on): TP4 c1 decode step -0.24 to -0.33 ms on
+# GB300 at 2k-300k (DSpark K7, AL 4.05), the KV cache 5.77M -> 2.82M tokens.
+EXPERT_REPLICAS_TPS = (4,)
+
+
 def expert_replicas(vllm_config) -> bool:
     """Whether the persistent expert kernel runs a window of the rank's experts
-    plus replicas of the next rank's (runtime/replicas.py), as
-    ``additional_config`` ``"expert_replicas"`` sets it (off by default). Needs
-    the persistent experts; costs REPLICAS experts of memory per NVFP4 layer
-    and rank. Reads the config only, so every rank agrees."""
+    plus replicas of the next rank's (runtime/replicas.py): by default at
+    EXPERT_REPLICAS_TPS when the persistent experts are on, or as
+    ``additional_config`` ``"expert_replicas"`` sets it. Costs REPLICAS
+    experts of memory per NVFP4 layer and rank (~51 GiB at TP4). Reads the
+    config only, so every rank agrees."""
     extra = vllm_config.additional_config
-    wanted = extra.get("expert_replicas", False) if isinstance(extra, dict) else False
+    tp = vllm_config.parallel_config.tensor_parallel_size
+    default = tp in EXPERT_REPLICAS_TPS and persistent_experts(vllm_config)
+    wanted = (
+        extra.get("expert_replicas", default) if isinstance(extra, dict) else default
+    )
     if not isinstance(wanted, bool):
         raise ValueError("additional_config expert_replicas must be a bool")
     if wanted and not persistent_experts(vllm_config):
         raise ValueError("additional_config expert_replicas needs persistent_experts")
-    if wanted and vllm_config.parallel_config.tensor_parallel_size not in (4, 8):
+    if wanted and tp not in (4, 8):
         # The window (256 / tp + 32 experts) must be one the kernel compiles.
         raise ValueError("additional_config expert_replicas needs TP 4 or 8")
     return wanted
