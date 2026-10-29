@@ -999,16 +999,9 @@ class FlashInferOps:
             # A replica's rows equal its owner's only if the activations are
             # quantized with the same global scales on every rank.
             for layer in nvfp4_layers:
-                experts, _ = stock_experts(layer.feed_forward)
-                index = layer.layer_idx
-                stock = stock_shards(self.nvfp4[index], experts)
-                reason = expert_tp.agree(
-                    tp.device_group,
-                    expert_tp.check_global_scales(stock, tp.device_group),
-                    stock.w13.device,
-                )
+                reason = self.global_scales_reason(tp, layer)
                 if reason is not None:
-                    reason = f"layer {index}: {reason}"
+                    reason = f"layer {layer.layer_idx}: {reason}"
                     break
         if reason is not None:
             raise RuntimeError(f"Expert replicas: {reason}.")
@@ -1074,6 +1067,18 @@ class FlashInferOps:
             er.REPLICAS,
             len(self.windows),
             next(iter(self.windows.values()))[1].shape[0] if self.windows else 0,
+        )
+
+    def global_scales_reason(self, tp, layer: nn.Module) -> str | None:
+        """None when the layer's expert global input scales are the same on
+        every rank (collective). A function of its own so that no view of
+        the stock tensors outlives it: the window build frees them."""
+        experts, _ = stock_experts(layer.feed_forward)
+        stock = stock_shards(self.nvfp4[layer.layer_idx], experts)
+        return expert_tp.agree(
+            tp.device_group,
+            expert_tp.check_global_scales(stock, tp.device_group),
+            stock.w13.device,
         )
 
     def has_replicas(self, layer: int) -> bool:
