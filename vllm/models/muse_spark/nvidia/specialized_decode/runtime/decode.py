@@ -154,7 +154,17 @@ def set_kv_cache_scales(layers, scales: tuple[tuple[int, float, float], ...]) ->
         # FlashInferImpl derives its bmm scales from these on first use.
         attn.impl.bmm1_scale = None
         attn.impl.bmm2_scale = None
-    logger.info("Muse Spark fp8 KV scales set on %d layers", len(scales))
+    fp8_layers = sorted(
+        layer.layer_idx
+        for layer in layers
+        if layer.self_attn.attn.kv_cache_dtype in ("fp8", "fp8_e4m3")
+    )
+    unset = sorted(set(fp8_layers) - {index for index, _, _ in scales})
+    logger.info(
+        "Muse Spark fp8 KV scales set on layers %s%s",
+        [index for index, _, _ in scales],
+        f"; fp8 layers at scale 1: {unset}" if unset else "",
+    )
 
 
 class SpecializedDecode:

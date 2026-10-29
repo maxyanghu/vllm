@@ -54,6 +54,12 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
     Raises when the specialized decode is requested for an unsupported deployment."""
     backend = decode_backend(vllm_config)
     if backend == "auto":
+        extra = vllm_config.additional_config
+        if isinstance(extra, dict) and "kv_cache_scales" in extra:
+            raise ValueError(
+                "additional_config kv_cache_scales is applied by the specialized "
+                "decode only (decode_backend latency_specialized)"
+            )
         return None
     if backend != "latency_specialized":
         raise ValueError("Supported decode_backend values are auto/latency_specialized")
@@ -174,6 +180,8 @@ def kv_cache_scales(vllm_config) -> tuple[tuple[int, float, float], ...]:
     spec = extra.get("kv_cache_scales") if isinstance(extra, dict) else None
     if spec is None:
         return ()
+    # Only the specialized decode applies them: a stock run would silently
+    # keep scale 1 (checked in specialized_decode_config before this).
     if vllm_config.cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
         raise ValueError("additional_config kv_cache_scales needs an fp8 KV cache")
     if isinstance(spec, str):
@@ -183,6 +191,8 @@ def kv_cache_scales(vllm_config) -> tuple[tuple[int, float, float], ...]:
         raise ValueError("additional_config kv_cache_scales must be a dict or path")
     out = []
     for key, value in spec.items():
+        if not (isinstance(value, (list, tuple)) and len(value) == 2):
+            raise ValueError(f"kv_cache_scales[{key}] must be [k_scale, v_scale]")
         k_scale, v_scale = (float(x) for x in value)
         if not (k_scale > 0 and v_scale > 0):
             raise ValueError(f"kv_cache_scales[{key}]: scales must be positive")
@@ -214,7 +224,14 @@ def unsupported(vllm_config) -> str | None:
     fp8_kv = kv_dtype in ("fp8", "fp8_e4m3")
     draft_model = None if spec is None else spec.draft_model_config
     draft = None if draft_model is None else draft_model.hf_config
-    draft_types = getattr(draft, "layer_types", None) or ()
+    # A DSpark draft layer slides when its global_attn_cfg entry (cycled
+    # over the layers) is a positive window, as the model builds it.
+    draft_windows = getattr(draft, "global_attn_cfg", None)
+    draft_sliding = (
+        isinstance(draft_windows, (list, tuple))
+        and len(draft_windows) > 0
+        and all(isinstance(w, int) and w > 0 for w in draft_windows)
+    )
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
@@ -321,12 +338,7 @@ def unsupported(vllm_config) -> str | None:
         # The draft's fused stores and QKV front take a bf16 cache: every
         # draft layer must be a skipped (sliding) one.
         (
-            fp8_kv
-            and draft is not None
-            and (
-                not draft_types
-                or any(kind != "sliding_attention" for kind in draft_types)
-            ),
+            fp8_kv and draft is not None and not draft_sliding,
             "an fp8 KV cache with DSpark draft layers that are not sliding",
         ),
         (vllm_config.kv_transfer_config is not None, "KV transfer"),
