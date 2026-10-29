@@ -428,18 +428,24 @@ def kv_cache_layout_ok(kv_cache: torch.Tensor, num_kv_heads: int) -> bool:
     """Whether a KV cache has the layout the QKV front and attn2 read:
     ``[pages, num_kv_heads, 16, 128]`` (K | V per slot), dense pages of dense
     heads, 16-byte aligned; bf16 (both) or float8_e4m3fn (the QKV front
-    only; attn2 refuses it)."""
+    only; attn2 refuses it), whose pages may hold 32 tokens (vLLM aligns an
+    fp8 page to the bf16 skip layers' pages)."""
     row = 2 * HEAD_DIM
+    fp8 = kv_cache.dtype == torch.float8_e4m3fn
     if (
         kv_cache.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
         or kv_cache.dim() != 4
-        or tuple(kv_cache.shape[1:]) != (num_kv_heads, BLOCK_SIZE, row)
+        or tuple(kv_cache.shape[1:2]) != (num_kv_heads,)
+        or kv_cache.shape[2]
+        not in ((BLOCK_SIZE, 2 * BLOCK_SIZE) if fp8 else (BLOCK_SIZE,))
+        or kv_cache.shape[3] != row
     ):
         return False
+    page = kv_cache.shape[2]
     stride = kv_cache.stride()
     return (
-        stride[0] == num_kv_heads * BLOCK_SIZE * row
-        and (num_kv_heads == 1 or stride[1] == BLOCK_SIZE * row)
+        stride[0] == num_kv_heads * page * row
+        and (num_kv_heads == 1 or stride[1] == page * row)
         and stride[2] == row
         and stride[3] == 1
         and kv_cache.data_ptr() % 16 == 0

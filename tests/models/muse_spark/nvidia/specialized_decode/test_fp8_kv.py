@@ -62,21 +62,41 @@ def _front_inputs(kv_heads: int, m: int, seed: int):
 
 @pytest.mark.parametrize("kv_heads", [4, 2], ids=["tp4", "tp8"])
 @pytest.mark.parametrize("m", [8, 3])
-def test_qkv_front_fp8_store(kv_heads, m):
+@pytest.mark.parametrize("page", [16, 32])
+# (k, v): powers of two, others, and one that saturates e4m3.
+@pytest.mark.parametrize("scales", [(0.5, 2.0), (0.3, 1.7), (1 / 512, 0.11)])
+def test_qkv_front_fp8_store(kv_heads, m, page, scales):
+    """The fp8 store (16- or 32-token pages) against the bf16 store's values
+    quantized in torch; the projection output is the bf16 call's."""
     x, w, positions, cos_sin, slots, pages = _front_inputs(kv_heads, m, m + kv_heads)
     dev = x.device
-    cache16 = torch.zeros(pages, kv_heads, 16, 2 * HEAD_DIM, dtype=torch.bfloat16)
+    pages = pages * 16 // page
+    cache16 = torch.zeros(pages, kv_heads, page, 2 * HEAD_DIM, dtype=torch.bfloat16)
     cache16 = cache16.to(dev)
     cache8 = torch.zeros_like(cache16, dtype=torch.float8_e4m3fn)
-    k_scale = torch.tensor([0.5], device=dev)
-    v_scale = torch.tensor([2.0], device=dev)
+    k_scale = torch.tensor([scales[0]], device=dev)
+    v_scale = torch.tensor([scales[1]], device=dev)
     out16 = torch.empty(m, w.shape[0], dtype=torch.bfloat16, device=dev)
     out8 = torch.empty_like(out16)
-    ops.muse_spark_qkv_front(x, w, positions, cos_sin, slots, cache16, out16, EPS)
+    if page == 32:
+        # bf16 pages hold 16 tokens: the reference writes a 16-token view of
+        # the same slots (slot s is token s % 16 of page s // 16 there).
+        ref16 = torch.zeros(pages * 2, kv_heads, 16, 2 * HEAD_DIM)
+        ref16 = ref16.to(dev, torch.bfloat16)
+        ops.muse_spark_qkv_front(x, w, positions, cos_sin, slots, ref16, out16, EPS)
+        # Back to 32-token pages: page p holds tokens of 16-pages 2p, 2p + 1.
+        cache16.copy_(
+            ref16.view(pages, 2, kv_heads, 16, 2 * HEAD_DIM)
+            .transpose(1, 2)
+            .reshape(pages, kv_heads, 32, 2 * HEAD_DIM)
+        )
+    else:
+        ops.muse_spark_qkv_front(x, w, positions, cos_sin, slots, cache16, out16, EPS)
     ops.muse_spark_qkv_front(
         x, w, positions, cos_sin, slots, cache8, out8, EPS, k_scale, v_scale
     )
     assert torch.equal(out16.view(torch.int16), out8.view(torch.int16))
+    # The kernel multiplies by the fp32 reciprocal, as the stock insert does.
     k16 = cache16[..., :HEAD_DIM].float() * (1.0 / k_scale)
     v16 = cache16[..., HEAD_DIM:].float() * (1.0 / v_scale)
     want = torch.cat([k16, v16], dim=-1).clamp(-448.0, 448.0)
@@ -125,12 +145,13 @@ def _provider(kv_heads: int, cache: torch.Tensor, scales, dev):
 
 @pytest.mark.parametrize("kv_heads", [4, 2], ids=["tp4", "tp8"])
 @pytest.mark.parametrize("length", [100, 5000, 100_000])
-def test_stock_decode_fp8(kv_heads, length):
+@pytest.mark.parametrize("page", [16, 32])
+def test_stock_decode_fp8(kv_heads, length, page):
     torch.manual_seed(length + kv_heads)
     dev = torch.device("cuda")
-    scales = (1.0, 0.5, 0.25)
-    pages = (length + 15) // 16
-    cache = (torch.randn(pages + 3, kv_heads, 16, 128, device=dev) * 0.25).to(
+    scales = (0.5, 0.5, 0.25)
+    pages = (length + page - 1) // page
+    cache = (torch.randn(pages + 3, kv_heads, page, 128, device=dev) * 0.25).to(
         torch.float8_e4m3fn
     )
     block_table = torch.randperm(pages + 3, device=dev).to(torch.int32)[None, :pages]
@@ -140,12 +161,22 @@ def test_stock_decode_fp8(kv_heads, length):
     front = torch.randn(ROWS, 3 * width, device=dev).to(torch.bfloat16)
     q, gate = front[:, :width], front[:, 2 * width :]
     # The reference on the dequantized cache, with the query as the fp8 path
-    # quantizes it (q_scale 1).
+    # quantizes it (q / q_scale in e4m3, times q_scale).
     deq = cache.float()
     deq[..., :HEAD_DIM] *= scales[1]
     deq[..., HEAD_DIM:] *= scales[2]
-    q8 = q.float().to(torch.float8_e4m3fn).float()
-    ref = _reference(q8, gate, deq, block_table, length, kv_heads)
+    table16 = block_table
+    if page == 32:
+        # The reference reads 16-token pages: page p is 16-pages 2p, 2p + 1.
+        deq = (
+            deq.view(-1, kv_heads, 2, 16, 128)
+            .transpose(1, 2)
+            .reshape(-1, kv_heads, 16, 128)
+        )
+        table16 = torch.stack([2 * block_table, 2 * block_table + 1], dim=-1)
+        table16 = table16.reshape(1, -1)
+    q8 = (q.float() / scales[0]).to(torch.float8_e4m3fn).float() * scales[0]
+    ref = _reference(q8, gate, deq, table16, length, kv_heads)
     provider = _provider(kv_heads, cache, scales, dev)
     decode = SimpleNamespace(
         block_tables=block_table, seq_lens=seq_lens, max_seq_len=MAX_LEN
@@ -159,5 +190,5 @@ def test_stock_decode_fp8(kv_heads, length):
     eager = provider.stock_decode_attention(q, gate, cache, decode).clone()
     assert torch.equal(eager.view(torch.int16), replayed.view(torch.int16))
     err = _rel(replayed, ref)
-    print(f"kv_heads {kv_heads} L {length}: fp8 stock decode rel L2 {err:.2e}")
+    print(f"kv_heads {kv_heads} L {length} page {page}: fp8 decode rel L2 {err:.2e}")
     assert err < 3e-2, err

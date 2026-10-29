@@ -178,8 +178,10 @@ def unsupported(vllm_config) -> str | None:
     graphs = compilation.cudagraph_mode
     tp = parallel.tensor_parallel_size
     kv_dtype = model.dtype if cache.cache_dtype == "auto" else cache.cache_dtype
+    fp8_kv = kv_dtype in ("fp8", "fp8_e4m3")
     draft_model = None if spec is None else spec.draft_model_config
     draft = None if draft_model is None else draft_model.hf_config
+    draft_types = getattr(draft, "layer_types", None) or ()
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
@@ -270,7 +272,30 @@ def unsupported(vllm_config) -> str | None:
                 "--kv-cache-dtype-skip-layers sliding_window"
             ),
         ),
-        (cache.block_size != 16, "KV cache block sizes but 16"),
+        # An fp8 cache beside bf16 skip layers: vLLM raises the block size to
+        # 32 so the fp8 page covers the bf16 one (the fp8 layers' pages hold
+        # 32 tokens, the QKV front and TRT-LLM-gen take them).
+        (
+            cache.block_size not in ((16, 32) if fp8_kv else (16,)),
+            "KV cache block sizes but 16 (32 with an fp8 cache)",
+        ),
+        # The fp8 path quantizes the query as FlashInferImpl does on SM100
+        # (get_q_data_type), which this setting turns off.
+        (
+            fp8_kv and vllm_config.attention_config.disable_flashinfer_q_quantization,
+            "an fp8 KV cache with disable_flashinfer_q_quantization",
+        ),
+        # The draft's fused stores and QKV front take a bf16 cache: every
+        # draft layer must be a skipped (sliding) one.
+        (
+            fp8_kv
+            and draft is not None
+            and (
+                not draft_types
+                or any(kind != "sliding_attention" for kind in draft_types)
+            ),
+            "an fp8 KV cache with DSpark draft layers that are not sliding",
+        ),
         (vllm_config.kv_transfer_config is not None, "KV transfer"),
         (envs.VLLM_BATCH_INVARIANT, "batch-invariant mode"),
     )

@@ -327,6 +327,16 @@ class QkvAttention:
                 "(attn2 reads bf16; pass --kv-cache-dtype-skip-layers "
                 "sliding_window)"
             )
+        if provider.kv_fp8:
+            layer_attn = attn.attn
+            if any(
+                getattr(layer_attn, name).numel() != 1
+                for name in ("_q_scale", "_k_scale", "_v_scale")
+            ):
+                raise ValueError(
+                    f"layer {layer.layer_idx}: per-head fp8 KV scales (the "
+                    "QKV front and the query quantization take one scale)"
+                )
         # attn2 reads bf16 only: an fp8 full-attention layer runs the stock
         # decode at every length.
         if (ctx.stock_full_attention or provider.kv_fp8) and window == 0:
@@ -368,7 +378,7 @@ class QkvAttention:
         # The query as FlashInfer takes it: [rows, heads, head_dim], contiguous
         # (the QKV front leaves q as a column view of its output).
         self.query = ctx.buffers.get("stock_attention_query")
-        if self.query is None:
+        if self.query is None and not self.kv_fp8:
             self.query = torch.empty(
                 PREPARED_MAX,
                 attn.num_heads,
@@ -469,8 +479,9 @@ class QkvAttention:
             raise ValueError(
                 f"{self.layer_name}: KV cache {tuple(kv_cache.shape)} "
                 f"{kv_cache.stride()} {kv_cache.dtype} is not the 16-byte aligned "
-                f"bf16 [pages, {self.num_kv_heads}, 16, 128] layout with dense "
-                "pages the decode kernels read"
+                f"bf16 [pages, {self.num_kv_heads}, 16, 128] (fp8: 16 or 32 "
+                "tokens per page) layout with dense pages the decode kernels "
+                "read"
             )
         if self.stock_attention:
             self.warm_up_stock_attention(kv_cache)
@@ -487,7 +498,7 @@ class QkvAttention:
 
         device = kv_cache.device
         rows = csrc_ops.QUERY_LEN
-        pages = -(-self.max_context // csrc_ops.BLOCK_SIZE)
+        pages = -(-self.max_context // kv_cache.shape[2])
         decode = SimpleNamespace(
             block_tables=torch.zeros(1, pages, dtype=torch.int32, device=device),
             seq_lens=torch.full((1,), rows, dtype=torch.int32, device=device),

@@ -219,14 +219,18 @@ __device__ __forceinline__ int k_tile(int i, int rank) {
 struct KvStore {
   const float* k_scale;  // [1] or nullptr (bf16 cache)
   const float* v_scale;  // [1] or nullptr
+  int page_shift;        // log2 of the cache's tokens per page (16 or 32)
 };
 
 // Byte address of the kv_cache row of `slot` for kv head `kvh` (64-bit index
 // math: cache offsets exceed 2^31); esz = cache element bytes (2 or 1).
 __device__ __forceinline__ unsigned char* cache_row(unsigned char* cache,
                                                     long long slot, int HKV,
-                                                    int kvh, int esz) {
-  return cache + (((slot >> 4) * HKV + kvh) * 16 + (slot & 15)) *
+                                                    int kvh, int esz,
+                                                    int page_shift) {
+  const long long page = slot >> page_shift;
+  const long long off = slot & ((1LL << page_shift) - 1);
+  return cache + (((page * HKV + kvh) << page_shift) + off) *
                      (int64_t)(2 * D) * esz;
 }
 
@@ -285,11 +289,11 @@ __device__ __forceinline__ void finish_token(const float* rp, int rstride,
     }
     outv = __floats2bfloat162_rn(o0, o1);
     if (head >= grpB && slot >= 0)
-      store_kv2(cache_row(cache, slot, HKV, head - grpB, esz), 0, lane, outv,
-                kvs.k_scale);
+      store_kv2(cache_row(cache, slot, HKV, head - grpB, esz, kvs.page_shift), 0,
+                lane, outv, kvs.k_scale);
   } else if (head < grpD && slot >= 0) {
-    store_kv2(cache_row(cache, slot, HKV, head - grpC, esz), D, lane, yb,
-              kvs.v_scale);
+    store_kv2(cache_row(cache, slot, HKV, head - grpC, esz, kvs.page_shift), D,
+              lane, yb, kvs.v_scale);
   }
   reinterpret_cast<__nv_bfloat162*>(yrow)[lane] = outv;
 }
@@ -390,7 +394,7 @@ __global__ void __launch_bounds__(NTHREADS, 2)
       if (sl >= 0 && head >= grpB && head < grpD)
         prefetch_l2(cache_row(cache, sl, HKV,
                               head < grpC ? head - grpB : head - grpC,
-                              kvs.k_scale == nullptr ? 2 : 1) +
+                              kvs.k_scale == nullptr ? 2 : 1, kvs.page_shift) +
                     (head < grpC ? 0 : D) * (kvs.k_scale == nullptr ? 2 : 1));
     }
     if (rope && head < grpC) {
@@ -790,13 +794,17 @@ void fused_muse_spark_qkv_qknorm_rope_kv_insert(
   }
   // An fp8 cache comes with its per-tensor scales; a bf16 one with none.
   const bool fp8 = kv_cache.scalar_type() == ScalarType::Float8_e4m3fn;
+  // 16-token pages; an fp8 cache beside bf16 skip layers may have 32 (vLLM
+  // aligns the quantized pages to the bf16 ones).
+  const int64_t bs = kv_cache.size(2);
   STD_TORCH_CHECK((fp8 || kv_cache.scalar_type() == ScalarType::BFloat16) &&
-                      kv_cache.size(2) == 16 && kv_cache.size(3) == 2 * D,
-                  "kv_cache must be a bf16 or fp8_e4m3 [pages, HKV, 16, ",
-                  2 * D, "] tensor");
+                      (bs == 16 || (fp8 && bs == 32)) &&
+                      kv_cache.size(3) == 2 * D,
+                  "kv_cache must be a bf16 [pages, HKV, 16, ", 2 * D,
+                  "] or fp8_e4m3 [pages, HKV, 16 or 32, ", 2 * D, "] tensor");
   STD_TORCH_CHECK(k_scale.has_value() == fp8 && v_scale.has_value() == fp8,
                   "k_scale and v_scale go with an fp8 kv_cache, and only");
-  KvStore kvs{nullptr, nullptr};
+  KvStore kvs{nullptr, nullptr, bs == 32 ? 5 : 4};
   if (fp8) {
     for (const auto* t : {&*k_scale, &*v_scale}) {
       STD_TORCH_CHECK(t->scalar_type() == ScalarType::Float &&
@@ -806,8 +814,8 @@ void fused_muse_spark_qkv_qknorm_rope_kv_insert(
     kvs.k_scale = static_cast<const float*>(k_scale->data_ptr());
     kvs.v_scale = static_cast<const float*>(v_scale->data_ptr());
   }
-  STD_TORCH_CHECK(kv_cache.stride(0) == (int64_t)HKV * 16 * 2 * D &&
-                      (HKV == 1 || kv_cache.stride(1) == 16 * 2 * D) &&
+  STD_TORCH_CHECK(kv_cache.stride(0) == (int64_t)HKV * bs * 2 * D &&
+                      (HKV == 1 || kv_cache.stride(1) == bs * 2 * D) &&
                       kv_cache.stride(2) == 2 * D && kv_cache.stride(3) == 1 &&
                       aligned16(kv_cache),
                   "kv_cache rows must be at (page * HKV + head) * 16 + offset");
