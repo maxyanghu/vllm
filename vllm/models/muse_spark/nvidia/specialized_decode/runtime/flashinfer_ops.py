@@ -1058,6 +1058,12 @@ class FlashInferOps:
             if leak is not None:
                 raise RuntimeError(f"Expert replicas: {leak}.")
         if device is not None:
+            # The replaced stock tensors (the windows' own experts, copied)
+            # are free but still reserved by the caching allocator; give
+            # them back so the symmetric-memory mailboxes built next (and
+            # the KV cache sizing) see the memory.
+            torch.accelerator.synchronize(device)
+            torch.cuda.empty_cache()
             self.window_ids = torch.full(
                 (er.MAX_SLOTS // TOP_K, TOP_K), -1, dtype=torch.int32, device=device
             )
