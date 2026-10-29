@@ -7,7 +7,7 @@ window (own experts + the next rank's first replicas) with the assigned ids,
 whose every route row must equal FlashInfer's on the expert's owner, bit for
 bit, with every route served by exactly one rank. Needs one GB300 (SM103).
 
-Run: pytest -v tests/models/muse_spark/nvidia/specialized_decode/test_replicas.py
+Run: pytest -v tests/models/muse_spark/nvidia/specialized_decode/test_expert_replicas.py
 """
 
 import pytest
@@ -164,3 +164,59 @@ def test_assign_graph_replay():
         want = torch.empty_like(ids)
         er.assign(ids, want, 1, tp, local)
         assert torch.equal(out, want)
+        ref = er.assign_reference(ids.cpu(), tp, local)
+        assert torch.equal((out.cpu() >= 0), ref == 1)
+
+
+def _extend_worker(rank: int, world: int, init: str, queue) -> None:
+    import torch.distributed as dist
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", init_method=init, rank=rank, world_size=world)
+    try:
+        gen = torch.Generator(device="cuda").manual_seed(11)
+        local = NUM_EXPERTS // world
+        full_w = torch.randint(
+            0, 256, (NUM_EXPERTS, 3, 5), generator=gen, device="cuda"
+        ).to(torch.uint8)
+        full_s = torch.rand(NUM_EXPERTS, generator=gen, device="cuda")
+        full_f8 = full_s.view(NUM_EXPERTS, 1).expand(-1, 4).contiguous()
+        full_f8 = full_f8.to(torch.float8_e4m3fn)
+        own = slice(rank * local, (rank + 1) * local)
+        q = (rank + 1) % world
+        rep = slice(q * local, q * local + er.REPLICAS)
+        mine = (full_w[own].contiguous(), full_s[own].contiguous(),
+                full_f8[own].contiguous())  # fmt: skip
+        out = er.extend_window(mine, dist.group.WORLD)
+        for got, full in zip(out, (full_w, full_s, full_f8)):
+            want = torch.cat([full[own], full[rep]])
+            assert got.dtype == full.dtype and got.shape == want.shape
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+        queue.put((rank, "ok"))
+    except Exception as e:  # noqa: BLE001
+        queue.put((rank, repr(e)))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [4])
+def test_extend_window(world, tmp_path):
+    """The NCCL ring: each rank's window is its own experts, then the next
+    rank's first REPLICAS, byte for byte, for uint8 / fp32 / fp8 tensors."""
+    import torch.multiprocessing as mp
+
+    if torch.cuda.device_count() < world:
+        pytest.skip(f"needs {world} GPUs")
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+    init = f"file://{tmp_path}/rdzv"
+    procs = [
+        ctx.Process(target=_extend_worker, args=(r, world, init, queue))
+        for r in range(world)
+    ]
+    for p in procs:
+        p.start()
+    results = dict(queue.get(timeout=300) for _ in procs)
+    for p in procs:
+        p.join(timeout=60)
+    assert results == {r: "ok" for r in range(world)}, results

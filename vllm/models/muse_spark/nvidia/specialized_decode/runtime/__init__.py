@@ -140,6 +140,9 @@ def expert_replicas(vllm_config) -> bool:
         raise ValueError("additional_config expert_replicas must be a bool")
     if wanted and not persistent_experts(vllm_config):
         raise ValueError("additional_config expert_replicas needs persistent_experts")
+    if wanted and vllm_config.parallel_config.tensor_parallel_size not in (4, 8):
+        # The window (256 / tp + 32 experts) must be one the kernel compiles.
+        raise ValueError("additional_config expert_replicas needs TP 4 or 8")
     return wanted
 
 

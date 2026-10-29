@@ -930,7 +930,7 @@ class FlashInferOps:
             ):
                 raise ValueError(
                     f"layer {layer}: the persistent expert kernel does not serve "
-                    f"{args['local_num_experts']} local experts of intermediate "
+                    f"{operands[1].shape[0]} local experts of intermediate "
                     f"size {args['intermediate_size']}."
                 )
             pe.prepare(*operands[:5])
@@ -959,28 +959,65 @@ class FlashInferOps:
 
     def extend_windows(self, tp, layers: tuple[nn.Module, ...]) -> None:
         """Every NVFP4 layer's window of its experts plus the next rank's first
-        ``REPLICAS`` (``replicas.extend_window``; collective), with the
-        stock layer's parameters re-pointed at the window's own experts, so
-        the replicas are the only new memory. Raises if the stock tensors stay
-        referenced elsewhere (the window would double the experts)."""
+        ``REPLICAS`` (``replicas.extend_window``; collective), with the stock
+        layer's parameters re-pointed at the window's own experts, so the
+        replicas are the only new memory. Every check is agreed across the
+        group before any rank raises, so none is left in a send/recv.
+
+        The windows are a snapshot of the loaded weights: an in-place weight
+        reload would update only the own experts (the re-pointed parameters),
+        not the replicas or the window scalars."""
+        from ..cutedsl.moe import persistent_experts as pe
         from . import replicas as er
 
         self.rank, self.world = tp.rank_in_group, tp.world_size
-        device = None
-        for layer in layers:
-            index = layer.layer_idx
-            if index not in self.nvfp4:
-                continue
+        nvfp4_layers = [layer for layer in layers if layer.layer_idx in self.nvfp4]
+        # The ring and the assignment take EP rank = TP rank, linear placement,
+        # a window the kernel is compiled for, and the stock quant config
+        # holding the layer's scale parameters.
+        reason = None
+        for layer in nvfp4_layers:
             experts, routed = stock_experts(layer.feed_forward)
             quant = experts.quant_config
-            if (
+            local = self.nvfp4[layer.layer_idx]["local_num_experts"]
+            if experts.ep_rank != tp.rank_in_group:
+                reason = f"EP rank {experts.ep_rank} on TP rank {tp.rank_in_group}"
+            elif local * tp.world_size != routed.global_num_experts:
+                reason = f"{local} x {tp.world_size} is not the expert count"
+            elif local + er.REPLICAS not in pe.WINDOWS:
+                reason = f"no kernel for a window of {local + er.REPLICAS} experts"
+            elif (
                 quant.w1_scale is not routed.w13_weight_scale
                 or quant.w2_scale is not routed.w2_weight_scale
             ):
-                raise RuntimeError(
-                    "Expert replicas: the stock quant config does not hold the "
-                    "layer's scale parameters."
+                reason = "the quant config does not hold the layer's scales"
+            if reason is not None:
+                reason = f"layer {layer.layer_idx}: {reason}"
+                break
+        reason = expert_tp.agree(tp.cpu_group, reason, "cpu")
+        if reason is None:
+            # A replica's rows equal its owner's only if the activations are
+            # quantized with the same global scales on every rank.
+            for layer in nvfp4_layers:
+                experts, _ = stock_experts(layer.feed_forward)
+                index = layer.layer_idx
+                stock = stock_shards(self.nvfp4[index], experts)
+                reason = expert_tp.agree(
+                    tp.device_group,
+                    expert_tp.check_global_scales(stock, tp.device_group),
+                    stock.w13.device,
                 )
+                if reason is not None:
+                    reason = f"layer {index}: {reason}"
+                    break
+        if reason is not None:
+            raise RuntimeError(f"Expert replicas: {reason}.")
+
+        device = None
+        for layer in nvfp4_layers:
+            index = layer.layer_idx
+            experts, routed = stock_experts(layer.feed_forward)
+            quant = experts.quant_config
             local = self.nvfp4[index]["local_num_experts"]
             params = (
                 routed.w13_weight,
@@ -1012,18 +1049,24 @@ class FlashInferOps:
             )
             torch.accelerator.synchronize(device)
             grown = torch.cuda.memory_allocated(device) - before
+            # A stock tensor still referenced elsewhere keeps its L experts
+            # alive; the smallest (a block-scale tensor) is several MiB, well
+            # above the allocator's rounding of the new tensors.
             replica_bytes = sum(
                 w[local:].numel() * w.element_size() for w in (*windows, *scalars)
             )
-            if grown > 1.25 * replica_bytes + (64 << 20):
-                raise RuntimeError(
-                    f"Expert replicas: layer {index} grew {grown} bytes for "
-                    f"{replica_bytes} bytes of replicas; the stock experts are "
-                    "still referenced."
+            leak = None
+            if grown > replica_bytes + (2 << 20) * (len(windows) + len(scalars)):
+                leak = (
+                    f"layer {index} grew {grown} bytes for {replica_bytes} bytes "
+                    "of replicas; a stock expert tensor is still referenced"
                 )
+            leak = expert_tp.agree(tp.cpu_group, leak, "cpu")
+            if leak is not None:
+                raise RuntimeError(f"Expert replicas: {leak}.")
         if device is not None:
             self.window_ids = torch.full(
-                (BATCHES[0], TOP_K), -1, dtype=torch.int32, device=device
+                (er.MAX_SLOTS // TOP_K, TOP_K), -1, dtype=torch.int32, device=device
             )
         logger.info(
             "Muse Spark expert replicas: %d per rank on %d NVFP4 layers "
@@ -1042,10 +1085,10 @@ class FlashInferOps:
         the stream that the experts' launch follows), else None."""
         from . import replicas as er
 
-        window = self.windows.get(layer)
-        if window is None or ids.shape[0] > BATCHES[0]:
+        if layer not in self.windows or not self.is_persistent(layer, ids.shape[0]):
             return None
         assert self.window_ids is not None
+        assert ids.numel() <= self.window_ids.numel()
         out = self.window_ids[: ids.shape[0]]
         local = self.nvfp4[layer]["local_num_experts"]
         er.assign(ids, out, self.rank, self.world, local)
@@ -1072,6 +1115,7 @@ class FlashInferOps:
             ids = topk.local_ids
             if ids is None:
                 ids = self.assign_replicas(layer, topk.ids)
+            assert ids is not None
         rows, index = pe.persistent_experts(
             offset,
             inputs.a,

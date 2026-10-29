@@ -104,7 +104,8 @@ def assign(ids: torch.Tensor, out: torch.Tensor, rank: int, tp: int, local: int)
     ``ids`` (int32 ``[b, top_k]`` global expert ids, ``b * top_k <=
     MAX_SLOTS``); graph-capturable, allocates nothing."""
     n = ids.numel()
-    assert n <= MAX_SLOTS and out.numel() >= n and ids.is_contiguous()
+    assert n <= MAX_SLOTS and ids.is_contiguous() and ids.dtype == torch.int32
+    assert out.numel() >= n and out.is_contiguous() and out.dtype == torch.int32
     _assign_kernel[(1,)](
         ids, out, n, rank, TP=tp, LOCAL=local, REP=REPLICAS, SLOTS=MAX_SLOTS,
         num_warps=4,
