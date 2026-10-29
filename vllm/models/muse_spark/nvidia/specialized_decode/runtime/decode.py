@@ -133,6 +133,30 @@ class DecodeLayer(NamedTuple):
     aux: torch.Tensor | None
 
 
+def set_kv_cache_scales(layers, scales: tuple[tuple[int, float, float], ...]) -> None:
+    """Sets the calibrated fp8 KV scales on the stock attention layers (the
+    device tensors the stock insert and the QKV front read, and the host
+    floats FlashInferImpl and the stock decode take), before any forward
+    that would cache them. Raises for a layer that is not an fp8 one."""
+    by_index = {layer.layer_idx: layer for layer in layers}
+    for index, k_scale, v_scale in scales:
+        layer = by_index.get(index)
+        attn = None if layer is None else layer.self_attn.attn
+        if attn is None or attn.kv_cache_dtype not in ("fp8", "fp8_e4m3"):
+            raise ValueError(f"kv_cache_scales: layer {index} has no fp8 KV cache")
+        attn._k_scale.fill_(k_scale)
+        attn._v_scale.fill_(v_scale)
+        attn._k_scale_float = k_scale
+        attn._v_scale_float = v_scale
+        for name, value in (("_k_scale_cpu", k_scale), ("_v_scale_cpu", v_scale)):
+            if isinstance(getattr(attn, name, None), torch.Tensor):
+                getattr(attn, name).fill_(value)
+        # FlashInferImpl derives its bmm scales from these on first use.
+        attn.impl.bmm1_scale = None
+        attn.impl.bmm2_scale = None
+    logger.info("Muse Spark fp8 KV scales set on %d layers", len(scales))
+
+
 class SpecializedDecode:
     """Built once the weights are loaded and the aux layers set; owns every provider
     and the decode buffers. Reads the backbone, never modifies it."""
@@ -150,6 +174,8 @@ class SpecializedDecode:
         self.aux_layers = tuple(backbone.aux_hidden_state_layers)
         self.residual_dtype = backbone.residual_dtype
         self.buffers: dict[str, torch.Tensor] = {}
+        if config.kv_cache_scales:
+            set_kv_cache_scales(self.layers, config.kv_cache_scales)
         # Decided once: the fused all-reduces sum in the stock all-reduce's
         # order (collective: creates its workspace on first use).
         all_reduce_order = (

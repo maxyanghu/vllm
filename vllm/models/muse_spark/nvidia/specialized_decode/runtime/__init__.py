@@ -38,6 +38,9 @@ class DecodeConfig:
     # persistent expert kernel, each step routing an expert to the less loaded
     # of its ranks. See expert_replicas().
     expert_replicas: bool = False
+    # Per full-attention layer (layer index, k_scale, v_scale) of an fp8 KV
+    # cache, set on the stock layers before any forward. See kv_cache_scales().
+    kv_cache_scales: tuple[tuple[int, float, float], ...] = ()
 
 
 def decode_backend(vllm_config) -> str:
@@ -67,6 +70,7 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         persistent_experts=persistent_experts(vllm_config),
         stock_full_attention=stock_full_attention(vllm_config),
         expert_replicas=expert_replicas(vllm_config),
+        kv_cache_scales=kv_cache_scales(vllm_config),
     )
 
 
@@ -155,6 +159,35 @@ def expert_replicas(vllm_config) -> bool:
         # The window (256 / tp + 32 experts) must be one the kernel compiles.
         raise ValueError("additional_config expert_replicas needs TP 4 or 8")
     return wanted
+
+
+def kv_cache_scales(vllm_config) -> tuple[tuple[int, float, float], ...]:
+    """The fp8 KV cache's per-layer scales from ``additional_config``
+    ``"kv_cache_scales"``: ``{"<layer index>": [k_scale, v_scale], ...}`` or
+    the path of a JSON file holding it (calibrated offline, e.g. amax / 448 of
+    each layer's K and V). Muse Spark Open's checkpoint ships none, so an fp8
+    cache otherwise runs at scale 1. Needs an fp8 KV cache. Reads the config
+    (and the file) only, so every rank agrees."""
+    import json
+
+    extra = vllm_config.additional_config
+    spec = extra.get("kv_cache_scales") if isinstance(extra, dict) else None
+    if spec is None:
+        return ()
+    if vllm_config.cache_config.cache_dtype not in ("fp8", "fp8_e4m3"):
+        raise ValueError("additional_config kv_cache_scales needs an fp8 KV cache")
+    if isinstance(spec, str):
+        with open(spec) as f:
+            spec = json.load(f)
+    if not isinstance(spec, dict):
+        raise ValueError("additional_config kv_cache_scales must be a dict or path")
+    out = []
+    for key, value in spec.items():
+        k_scale, v_scale = (float(x) for x in value)
+        if not (k_scale > 0 and v_scale > 0):
+            raise ValueError(f"kv_cache_scales[{key}]: scales must be positive")
+        out.append((int(key), k_scale, v_scale))
+    return tuple(sorted(out))
 
 
 def unsupported(vllm_config) -> str | None:
