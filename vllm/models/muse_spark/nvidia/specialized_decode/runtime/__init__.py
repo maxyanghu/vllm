@@ -139,9 +139,11 @@ def persistent_experts(vllm_config) -> bool:
 
 
 # The TP sizes whose persistent expert kernel runs with replicas by default
-# (with the persistent experts on): TP4 c1 decode step -0.24 to -0.33 ms on
-# GB300 at 2k-300k (DSpark K7, AL 4.05), the KV cache 5.77M -> 2.82M tokens.
-EXPERT_REPLICAS_TPS = (4,)
+# (with the persistent experts on): none. At TP4 they take the c1 decode step
+# -0.24 to -0.33 ms on GB300 at 2k-300k (DSpark K7, AL 4.05; the KV cache
+# 5.77M -> 2.82M tokens), but GSM8K-500 served by the c1 decode (concurrency
+# 1) scored 0.958 against 0.962 without them, under the 0.96 bar.
+EXPERT_REPLICAS_TPS: tuple[int, ...] = ()
 
 
 def expert_replicas(vllm_config) -> bool:
