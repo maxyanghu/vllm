@@ -65,7 +65,9 @@ order.
 - DeepSeek-V4.1: the candidate source layer selects its candidate blocks, and
   expands them into the sparse block ids of its first consumer layer, on a side
   stream that the consumer joins. The main query projection and cache inserts
-  run beside the indexer, and the indexer query beside the index key.
+  run beside the indexer, and the indexer query beside the index key. With the
+  die split, the candidate source layer also keeps its top-k per domain and
+  joins the two score arrays as part of the deferred candidate work.
 
 The overlap works with and without `VLLM_INDEXER_LOCALIZE`. It is off with
 micro-batching (`--enable-dbo` or `--ubatch-size`).

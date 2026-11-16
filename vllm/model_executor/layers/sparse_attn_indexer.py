@@ -510,6 +510,105 @@ def _varlen_decode_rows(
     )
 
 
+def _localized_candidate_source_topk(
+    attn_metadata_narrowed: DeepseekV32IndexerMetadata,
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_model_len: int,
+    logits_dtype: torch.dtype,
+    topk_backend: str,
+    topk_tokens: int,
+    topk_out: torch.Tensor,
+    candidate_blocks: torch.Tensor,
+    candidate_block_size: int,
+) -> bool:
+    """The candidate source layer's decode with the die split and deferred
+    candidates: the token top-k runs per locality domain and is merged, and
+    the join of both domains' scores runs with the deferred candidate work
+    (selection and expansion), off the critical path.
+
+    Only on calls whose candidates are deferred (VLLM_INDEXER_OVERLAP, FULL
+    CUDA graph decode); otherwise the join would stay on the critical path,
+    and the caller takes the scan, join and stock top-k path. Candidate blocks
+    are bit-identical to that path's; kept tokens have the same score
+    multiset. Returns False, without launching anything, for that path.
+    """
+    from vllm.v1.attention.ops.indexer_localize import scan
+
+    decode_metadata = attn_metadata_narrowed.decode
+    assert decode_metadata is not None
+    loc = decode_metadata.localized
+    assert loc is not None
+    selector = get_indexer_topk(topk_backend)
+    if not scan.localized_topk_supported(
+        selector, topk_out.shape[0], max_model_len, topk_tokens
+    ):
+        return False
+    if not indexer_overlap.candidate_defer_allowed(attn_metadata_narrowed):
+        if envs.VLLM_INDEXER_OVERLAP:
+            # This path runs only inside captures; build its merge now.
+            scan.prepare_merge(
+                topk_tokens, logits_dtype, loc.page_rows, loc.resources.device
+            )
+        return False
+    kept: list[torch.Tensor] = []
+    if not scan.localized_paged_mqa_topk(
+        loc,
+        q,
+        kv_cache,
+        weights,
+        max_model_len,
+        logits_dtype,
+        decode_metadata.indices,
+        topk_tokens,
+        attn_metadata_narrowed.max_seq_len,
+        topk_out,
+        keep=kept,
+    ):
+        return False
+    o0, o1 = kept
+    row_ends = seq_lens.reshape(-1)
+
+    def takes_bf16(t: torch.Tensor) -> bool:
+        return selector.takes_bf16_logits(t, topk_tokens, t.shape[0])
+
+    out = scan.localized_join_alloc(o0, lambda bf16: not takes_bf16(bf16))
+    num_rows = out.shape[0]
+    vis = row_ends[:num_rows]
+    decode_candidates = candidate_blocks[:num_rows]
+
+    def candidate_work() -> None:
+        scan.localized_join_scores(loc, o0, o1, out, row_ends)
+        logits = out if takes_bf16(out) else as_fp32_logits(out, row_ends)
+        _select_candidate_blocks(
+            logits,
+            None,
+            vis,
+            decode_candidates.shape[1],
+            candidate_block_size,
+            decode_candidates,
+            1,
+            score_dtype=(
+                torch.float32
+                if topk_backend in ("auto", "cooperative", "persistent")
+                else None
+            ),
+        )
+        indexer_overlap.expand_sparse_decode_rows(
+            attn_metadata_narrowed, candidate_blocks, candidate_block_size
+        )
+
+    # Both domains' scores (allocated on their streams) and the joined array
+    # stay referenced until the first candidate consumer joins, so their
+    # memory is not reused before the candidate stream has read them.
+    indexer_overlap.defer_candidates(
+        candidate_work, (o0, o1, out, vis, row_ends, loc.join_map)
+    )
+    return True
+
+
 def _gather_workspace_shapes(
     total_seq_lens: int,
     head_dim: int,
@@ -1227,6 +1326,25 @@ def sparse_attn_indexer(
                         topk_tokens,
                         attn_metadata_narrowed.max_seq_len,
                         topk_indices_buffer[:num_padded_tokens, :topk_tokens],
+                    )
+                ):
+                    return topk_indices_buffer
+                if (
+                    candidate_write
+                    and candidate_blocks is not None
+                    and _localized_candidate_source_topk(
+                        attn_metadata_narrowed,
+                        q,
+                        kv_cache,
+                        decode_weights,
+                        seq_lens,
+                        max_model_len,
+                        logits_dtype,
+                        topk_backend,
+                        topk_tokens,
+                        topk_indices_buffer[:num_padded_tokens, :topk_tokens],
+                        candidate_blocks,
+                        candidate_block_size,
                     )
                 ):
                     return topk_indices_buffer

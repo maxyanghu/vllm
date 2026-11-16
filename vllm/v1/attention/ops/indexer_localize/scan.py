@@ -501,6 +501,15 @@ def _merge_kernel(
     )
 
 
+def prepare_merge(
+    topk: int, logits_dtype: torch.dtype, page_rows: int, device_index: int
+) -> None:
+    """Compile the CUDA merge for a shape ahead of its first use, outside any
+    CUDA graph capture."""
+    if not torch.cuda.is_current_stream_capturing():
+        _merge_kernel(topk, logits_dtype == torch.float32, page_rows, device_index)
+
+
 def _merge_fits(
     o0: torch.Tensor,
     o1: torch.Tensor,
@@ -645,11 +654,13 @@ def localized_paged_mqa_topk(
     topk_tokens: int,
     max_seq_len: int,
     topk_out: torch.Tensor,
+    keep: list[torch.Tensor] | None = None,
 ) -> bool:
     """Per-domain scan and top-k, then the merge, into `topk_out`.
 
-    `topk_out` is the `[rows, K]` int32 view of the top-k buffer. When the
-    caller requested a deferred top-k
+    `topk_out` is the `[rows, K]` int32 view of the top-k buffer. With
+    `keep`, both domains' compact scores are appended to it (for a join the
+    caller runs later). When the caller requested a deferred top-k
     (`indexer_overlap.request_deferred_topk`), the call returns without
     joining: domain 0's stream waits for domain 1 and merges. Returns False,
     without launching anything, when this call cannot be localized.
@@ -701,5 +712,7 @@ def localized_paged_mqa_topk(
         indexer_overlap.set_deferred_topk(merge_stream, (q, weights, indices, outs))
         return True
     o0, o1 = torch.cuda.execute_on_streams(streams, scan_topk, range(len(streams)))
+    if keep is not None:
+        keep.extend((o0, o1))
     merge_candidates(loc, o0, o1, idx, topk_tokens, topk_out)
     return True
