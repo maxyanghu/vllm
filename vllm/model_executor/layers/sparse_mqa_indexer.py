@@ -23,12 +23,17 @@ from vllm.model_executor.kernels.attention.dsa.sparse_mqa_logits import (
     sparse_mqa_logits_paged_decode,
     sparse_mqa_logits_prefill_chunk,
 )
+from vllm.model_executor.layers import indexer_overlap
 from vllm.model_executor.layers.sparse_attn_indexer import (
     _gather_workspace_shapes,
     kv_cache_as_quant_view,
 )
 from vllm.platforms import current_platform
-from vllm.utils.deep_gemm import has_deep_gemm_sparse_mqa, mqa_logits_mx_inputs
+from vllm.utils.deep_gemm import (
+    get_paged_sparse_mqa_logits_metadata,
+    has_deep_gemm_sparse_mqa,
+    mqa_logits_mx_inputs,
+)
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerPrefillChunkMetadata,
     dsa_indexer_uses_fp4,
@@ -144,6 +149,9 @@ class SparseMQAIndexer(nn.Module):
         assert isinstance(metadata, DeepseekV41SparseIndexerMetadata), (
             "SparseMQAIndexer needs DeepseekV41SparseIndexerBackend metadata"
         )
+        # The first reader of the candidates and of the sparse-scan inputs
+        # built from them waits for deferred candidate work, if any.
+        indexer_overlap.join_candidates()
         assert k is None, "the model writes the indexer K cache"
         if self.use_fp4_cache:
             # MXFP4 values go to DeepGEMM as int8 (its packed-FP4 tag).
@@ -201,6 +209,26 @@ class SparseMQAIndexer(nn.Module):
             assert decode_rows is not None and decode_rows.block_table is not None
             assert decode_rows.row_indices is not None
             num_rows = decode_rows.row_ke.shape[0]
+            if (
+                num_rows > 0
+                and decode_rows.kernel_metadata is None
+                and indexer_overlap.take_expanded(decode_rows)
+            ):
+                # The deferred candidate work expanded the candidates into
+                # sparse_indices / end; build the schedule from them as
+                # sparse_mqa_logits_paged_decode would, which then reuses both.
+                # (DeepGEMM builds it only on the capturing stream.)
+                decode_rows.kernel_metadata = get_paged_sparse_mqa_logits_metadata(
+                    decode_rows.row_ke,
+                    decode_rows.block_table,
+                    decode_rows.row_indices,
+                    kv_cache_as_quant_view(
+                        kv_cache, self.head_dim, self.use_fp4_cache
+                    ).shape[1],
+                    decode_rows.sparse_indices,
+                    q_values.dtype,
+                    sparse_block_kv,
+                )
             if num_rows > 0:
                 decode_rows.kernel_metadata = sparse_mqa_logits_paged_decode(
                     q_values[:num_rows].unsqueeze(1),

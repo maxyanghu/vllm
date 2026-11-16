@@ -18,6 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, CUDAGraphMode, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
@@ -235,6 +236,10 @@ class KimiK3DSAIndexer(nn.Module):
         # The specialized decode merges each rank's packed local top-N in one
         # exchange (0 keeps the generic merge).
         self.dcp_local_topk = init_dcp_topk_merge(vllm_config, index_topk)
+        # wkv_index issued early on its own stream by prefetch_kv.
+        self._kv_stream: torch.cuda.Stream | None = None
+        self._kv_events: tuple[torch.cuda.Event, torch.cuda.Event] | None = None
+        self._prefetched_kv: tuple[torch.Tensor, torch.Tensor] | None = None
 
     @property
     def cp_kv_cache_interleave_size(self) -> int:
@@ -321,6 +326,30 @@ class KimiK3DSAIndexer(nn.Module):
             num_tokens,
         )
 
+    def prefetch_kv(self, hidden_states: torch.Tensor) -> None:
+        """Issue wkv_index, which reads only the layer input, on a side stream
+        beside the query chain (fused_qkv_a_proj, q norm, wq_index), for the
+        next `forward` with these hidden states, which waits for it."""
+        if self._kv_stream is None:
+            self._kv_stream = torch.cuda.Stream(device=hidden_states.device)
+            self._kv_events = (torch.cuda.Event(), torch.cuda.Event())
+        assert self._kv_events is not None
+        start, done = self._kv_events
+        start.record(torch.cuda.current_stream())
+        self._kv_stream.wait_event(start)
+        with torch.cuda.stream(self._kv_stream):
+            kv = self.wkv_index(hidden_states)[0]
+            done.record(self._kv_stream)
+        self._prefetched_kv = (hidden_states, kv)
+
+    def _take_prefetched_kv(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        prefetched, self._prefetched_kv = self._prefetched_kv, None
+        if prefetched is None or prefetched[0] is not hidden_states:
+            return None
+        assert self._kv_events is not None
+        torch.cuda.current_stream().wait_event(self._kv_events[1])
+        return prefetched[1]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -340,7 +369,10 @@ class KimiK3DSAIndexer(nn.Module):
         index_q = self.wq_index(index_q_input)[0].view(
             -1, self.index_num_heads, self.index_head_dim
         )
-        index_k, index_weights = self.wkv_index(hidden_states)[0].split(
+        kv = self._take_prefetched_kv(hidden_states)
+        if kv is None:
+            kv = self.wkv_index(hidden_states)[0]
+        index_k, index_weights = kv.split(
             [self.index_head_dim, self.index_num_heads], dim=-1
         )
         if rows is not None:
@@ -668,6 +700,8 @@ class KimiK3DSAAttention(nn.Module):
             quant_config,
             prefix,
             shardq_eligible=True,
+            defer_indexer_topk=envs.VLLM_INDEXER_OVERLAP
+            and not vllm_config.parallel_config.use_ubatching,
         )
 
         # Dense-MHA prefills never read the top-k indices (PCP excluded, as

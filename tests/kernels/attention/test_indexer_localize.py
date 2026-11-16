@@ -18,6 +18,7 @@ if not current_platform.is_cuda():
     pytest.skip("CUDA only", allow_module_level=True)
 
 from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config  # noqa: E402
+from vllm.model_executor.layers import indexer_overlap  # noqa: E402
 from vllm.model_executor.layers.indexer_topk import get_indexer_topk  # noqa: E402
 from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
     as_fp32_logits,
@@ -508,7 +509,7 @@ def _assert_same_kept_scores(
 def test_localized_decode_matches_single_launch(domains, fp4, page_rows, topk):
     """The die-split scan and join return the single-launch scores bit for
     bit; the per-domain top-k and merge keep the stock top-k's scores, also
-    inside a CUDA graph replayed over new queries."""
+    deferred inside a CUDA graph replayed over new queries."""
     case = _DecodeCase(fp4, page_rows, rows=4, context=96 * 1024)
     rows = case.seq_lens.shape[0]
     meta = case.localizer.build(case.block_table, case.seq_lens, case.indices, rows)
@@ -565,7 +566,12 @@ def test_localized_decode_matches_single_launch(domains, fp4, page_rows, topk):
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        indexer_overlap.request_deferred_topk()
         assert localized_topk()
+        stream = indexer_overlap.take_deferred_topk_stream()
+        assert stream is not None, "the top-k was not deferred"
+        torch.cuda.current_stream().wait_stream(stream)
+        indexer_overlap.release_deferred_topk()
     for _ in range(2):
         case.q_values.copy_(
             torch.randn_like(case.q_values, dtype=torch.float32).to(case.q_values.dtype)

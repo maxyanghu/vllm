@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.config import CacheConfig
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
+from vllm.model_executor.layers import indexer_overlap
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.models.common.ops import fused_q_kv_rmsnorm
@@ -79,6 +81,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         allow_short_prefill_indexer_scoring_skip: bool = False,
         fuse_qkv_rmsnorm: bool = False,
         shardq_eligible: bool = False,
+        defer_indexer_topk: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -111,6 +114,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # When True, fuse the q_a and kv_a RMSNorms into a single kernel launch
         # (MLA layers with q-LoRA). Opt-in; default False preserves other models.
         self.fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
+        # When True, FULL CUDA graph decode steps let the indexer's top-k
+        # land while this layer issues the work that does not read it
+        # (VLLM_INDEXER_OVERLAP). Opt-in per model.
+        self.defer_indexer_topk = defer_indexer_topk and self.indexer is not None
+        if self.defer_indexer_topk:
+            indexer_overlap.init_stock_topk_stream()
         # qrep is active when the query projection is a DCP-group-sharded layer
         # that materializes the full group head set locally.
         q_proj_layer = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
@@ -162,6 +171,107 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         self.prefix = prefix
 
+    def _defer_topk(self) -> bool:
+        """Whether this call may let the indexer's top-k land late: a sparse
+        layer with q-LoRA, no DCP query replication, and a FULL CUDA graph
+        capture of a pure decode batch."""
+        if (
+            not self.defer_indexer_topk
+            or not self.is_sparse
+            or self.skip_topk
+            or self.q_lora_rank is None
+            or self.dcp_q_replicate
+            or not indexer_overlap.full_cuda_graph_capture()
+        ):
+            return False
+        attn_metadata = get_forward_context().attn_metadata
+        return isinstance(attn_metadata, dict) and indexer_overlap.decode_only(
+            attn_metadata.get(self.mla_attn.layer_name)
+        )
+
+    def _forward_deferred_topk(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None,
+        skip_o_proj: bool,
+    ) -> torch.Tensor:
+        """`forward`'s ops, reordered around a deferred indexer top-k.
+
+        The indexer runs right after the q-LoRA norm; while its top-k is
+        computed elsewhere, this stream issues the work that never reads the
+        kept tokens (kv_a norm, q_b_proj, RoPE, the output gate, then inside
+        `mla_attn` the cache insert and the query preparation). The index
+        group's ready event is recorded on the stream that writes the kept
+        tokens; its remap waits on it, and sparse attention on the remap. An
+        indexer key projection that reads only the layer input
+        (`prefetch_kv`) is issued first, beside the query chain.
+        """
+        assert self.indexer is not None and self.q_lora_rank is not None
+        assert self.fused_qkv_a_proj is not None and self.q_a_layernorm is not None
+        assert self.q_b_proj is not None
+        prefetch_kv = getattr(self.indexer, "prefetch_kv", None)
+        if prefetch_kv is not None:
+            prefetch_kv(hidden_states)
+        qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = None
+        if self.fuse_qkv_rmsnorm:
+            q_c, kv_c_normed = fused_q_kv_rmsnorm(
+                q_c,
+                kv_c,
+                self.q_a_layernorm.weight.data,
+                self.kv_a_layernorm.weight.data,
+                self.q_a_layernorm.variance_epsilon,
+            )
+        else:
+            q_c = self.q_a_layernorm(q_c)
+
+        indexer_overlap.request_deferred_topk()
+        self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
+        topk_stream = indexer_overlap.take_deferred_topk_stream()
+
+        if kv_c_normed is None:
+            kv_c_normed = self.kv_a_layernorm(kv_c)
+        k_pe = k_pe.unsqueeze(1)
+        q = self.q_b_proj(q_c)[0].view(-1, self.num_heads, self.qk_head_dim)
+        if self.rotary_emb is not None:
+            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim :], k_pe
+            )
+        gate = None
+        if self.g_proj is not None:
+            gate = self.g_proj(hidden_states)[0].sigmoid()
+
+        # The kept tokens are ready on the stream that writes them (this one
+        # if the indexer joined).
+        if topk_stream is None:
+            self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
+        else:
+            with torch.cuda.stream(topk_stream):
+                self.mla_attn.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
+
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+        attn_out = self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+        )
+        # This stream has waited for the kept tokens: the deferred work's
+        # inputs may be freed.
+        indexer_overlap.release_deferred_topk()
+        if gate is not None:
+            attn_out = attn_out * gate
+        if skip_o_proj:
+            return attn_out
+        return self.o_proj(attn_out)[0]
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -169,6 +279,10 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         llama_4_scaling: torch.Tensor | None = None,
         skip_o_proj: bool = False,
     ) -> torch.Tensor:
+        if self._defer_topk():
+            return self._forward_deferred_topk(
+                positions, hidden_states, llama_4_scaling, skip_o_proj
+            )
         q_c = None
         kv_lora = None
 

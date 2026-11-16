@@ -1,15 +1,16 @@
-# Die-Local Sparse Indexer
+# Die-Local Sparse Indexer and Indexer Overlap
 
-An opt-in decode optimization for the sparse-attention indexer of Kimi K3.1 and
-DeepSeek-V4.1 (DeepSeek Sparse Attention), off by default; when unset, vLLM runs
-the stock indexer.
+Two opt-in decode optimizations for the sparse-attention indexer of Kimi K3.1 and
+DeepSeek-V4.1 (DeepSeek Sparse Attention). Both are off by default; with both
+unset, vLLM runs the stock indexer.
 
 | Environment variable | Default | What it does |
 | -------------------- | ------- | ------------ |
 | `VLLM_INDEXER_LOCALIZE` | `0` | Die-local indexer decode on GPUs with two memory locality domains |
+| `VLLM_INDEXER_OVERLAP` | `0` | Overlap the indexer's top-k with independent work of the same layer |
 
 ```bash
-VLLM_INDEXER_LOCALIZE=1 vllm serve <Kimi K3.1 or DeepSeek-V4.1 checkpoint> ...
+VLLM_INDEXER_LOCALIZE=1 VLLM_INDEXER_OVERLAP=1 vllm serve <Kimi K3.1 or DeepSeek-V4.1 checkpoint> ...
 ```
 
 ## Die-local indexer (`VLLM_INDEXER_LOCALIZE`)
@@ -48,3 +49,23 @@ parallelism, a KV connector, and for other models.
 When active, each rank logs `KV cache placed in ... runs alternating between 2
 locality domains` and, once per indexer cache group, `Die-local sparse indexer
 active for N layers`. Each fallback is logged once as a warning.
+
+## Indexer overlap (`VLLM_INDEXER_OVERLAP`)
+
+Decode steps captured as FULL CUDA graphs reorder independent work of the same
+layer around the indexer; the kernels and their inputs are unchanged, so the
+outputs are bit-identical. Eager steps and piecewise CUDA graphs keep the stock
+order.
+
+- Kimi K3.1: the indexer's scan and top-k run on another stream (with the die
+  split, on the domains' streams) and the layer issues the query projections,
+  the output gate, the MLA cache insert and the query preparation meanwhile;
+  sparse attention waits for the kept tokens. The indexer's key projection runs
+  on a side stream beside the query chain.
+- DeepSeek-V4.1: the candidate source layer selects its candidate blocks, and
+  expands them into the sparse block ids of its first consumer layer, on a side
+  stream that the consumer joins. The main query projection and cache inserts
+  run beside the indexer, and the indexer query beside the index key.
+
+The overlap works with and without `VLLM_INDEXER_LOCALIZE`. It is off with
+micro-batching (`--enable-dbo` or `--ubatch-size`).

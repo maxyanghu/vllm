@@ -25,6 +25,7 @@ from typing import Any
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers import indexer_overlap
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.indexer_localize.build import (
     LocalizedDecodeMetadata,
@@ -647,8 +648,11 @@ def localized_paged_mqa_topk(
 ) -> bool:
     """Per-domain scan and top-k, then the merge, into `topk_out`.
 
-    `topk_out` is the `[rows, K]` int32 view of the top-k buffer. Returns
-    False, without launching anything, when this call cannot be localized.
+    `topk_out` is the `[rows, K]` int32 view of the top-k buffer. When the
+    caller requested a deferred top-k
+    (`indexer_overlap.request_deferred_topk`), the call returns without
+    joining: domain 0's stream waits for domain 1 and merges. Returns False,
+    without launching anything, when this call cannot be localized.
     """
     rows = q[0].shape[0] * q[0].shape[1]
     if (
@@ -673,6 +677,29 @@ def localized_paged_mqa_topk(
         )
         return o
 
+    if indexer_overlap.consume_deferred_topk_request():
+        # Fork without joining: each domain stream waits for the caller's
+        # work so far, scans and selects; domain 0 then waits for domain 1
+        # and merges. The caller joins on domain 0's stream.
+        start = torch.cuda.Event()
+        start.record(torch.cuda.current_stream())
+        outs, done = [], []
+        for d, stream in enumerate(streams):
+            stream.wait_event(start)
+            with torch.cuda.stream(stream):
+                outs.append(scan_topk(d))
+                event = torch.cuda.Event()
+                event.record(stream)
+                done.append(event)
+        merge_stream = streams[0]
+        for event in done[1:]:
+            merge_stream.wait_event(event)
+        with torch.cuda.stream(merge_stream):
+            merge_candidates(loc, outs[0], outs[1], idx, topk_tokens, topk_out)
+        # The domain streams read q, weights and indices, allocated on the
+        # caller's stream, and domain 0 reads domain 1's scores.
+        indexer_overlap.set_deferred_topk(merge_stream, (q, weights, indices, outs))
+        return True
     o0, o1 = torch.cuda.execute_on_streams(streams, scan_topk, range(len(streams)))
     merge_candidates(loc, o0, o1, idx, topk_tokens, topk_out)
     return True
