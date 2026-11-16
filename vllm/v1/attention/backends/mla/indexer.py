@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -56,6 +56,12 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 from vllm.v1.utils import CpuGpuBuffer
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.ops.indexer_localize.build import (
+        IndexerDecodeLocalizer,
+        LocalizedDecodeMetadata,
+    )
 
 logger = init_logger(__name__)
 
@@ -708,6 +714,8 @@ class DeepSeekV32IndexerDecodeMetadata:
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
+    # Per-locality-domain scan inputs (VLLM_INDEXER_LOCALIZE).
+    localized: "LocalizedDecodeMetadata | None" = None
 
 
 @dataclass
@@ -1132,6 +1140,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.scheduler_metadata_buffer = torch.empty(
             (self.num_sms + 1, 2), dtype=torch.int32, device=self.device
         )
+        self.decode_localizer: IndexerDecodeLocalizer | None = None
+        if envs.VLLM_INDEXER_LOCALIZE:
+            from vllm.v1.attention.ops.indexer_localize.build import (
+                maybe_make_decode_localizer,
+            )
+
+            self.decode_localizer = maybe_make_decode_localizer(self, block_table_width)
 
         # Each compressed state must live on a single rank, so the DCP
         # interleave has to cover whole states.
@@ -1836,7 +1851,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            localized = None
+            if self.decode_localizer is not None and decode_indices is not None:
+                # The localized scans use per-domain schedules; the decode op
+                # builds the full-device one only if it falls back.
+                localized = self.decode_localizer.build(
+                    block_table, seq_lens, decode_indices, num_decode_tokens
+                )
+            if localized is None and current_platform.is_cuda() and has_deep_gemm():
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
@@ -1858,6 +1880,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_is_uniform=write_is_uniform,
                 write_max_decode_len=max_decode_len,
                 query_start_loc=common_attn_metadata.query_start_loc[: num_decodes + 1],
+                localized=localized,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

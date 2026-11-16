@@ -1154,17 +1154,88 @@ def sparse_attn_indexer(
                 weights[:num_padded_tokens],
                 logits_dtype,
             )
-            logits = fp8_fp4_paged_mqa_logits(
-                (padded_q_quant_cast, padded_q_scale),
-                kv_cache,
-                decode_weights,
-                seq_lens,
-                decode_metadata.block_table,
-                decode_metadata.schedule_metadata,
-                max_model_len=max_model_len,
-                logits_dtype=logits_dtype,
-                indices=decode_metadata.indices,
+            q = (padded_q_quant_cast, padded_q_scale)
+            localized = decode_metadata.localized
+            # One query row per request over the whole context on this rank:
+            # what the die-local path takes.
+            whole_rows = (
+                dcp_world_size == 1
+                and decode_metadata.global_seq_lens is None
+                and not needs_padded_path
+                and next_n == 1
             )
+            if whole_rows and localized is not None:
+                from vllm.v1.attention.ops.indexer_localize import scan
+
+                # Per-domain scan and top-k, then the merge; no full-length
+                # scores (VLLM_INDEXER_LOCALIZE).
+                if (
+                    candidate_blocks is None
+                    and scan.localized_topk_supported(
+                        get_indexer_topk(topk_backend),
+                        num_padded_tokens,
+                        max_model_len,
+                        topk_tokens,
+                    )
+                    and scan.localized_paged_mqa_topk(
+                        localized,
+                        q,
+                        kv_cache,
+                        decode_weights,
+                        max_model_len,
+                        logits_dtype,
+                        decode_metadata.indices,
+                        topk_tokens,
+                        attn_metadata_narrowed.max_seq_len,
+                        topk_indices_buffer[:num_padded_tokens, :topk_tokens],
+                    )
+                ):
+                    return topk_indices_buffer
+            logits = None
+            if (
+                localized is not None
+                and dcp_world_size == 1
+                and decode_metadata.global_seq_lens is None
+            ):
+                from vllm.v1.attention.ops.indexer_localize import scan
+
+                # One scan per locality domain and a join; the join may
+                # already write the FP32 scores the top-k wants.
+                logits = scan.localized_paged_mqa_logits(
+                    localized,
+                    q,
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    max_model_len,
+                    logits_dtype,
+                    decode_metadata.indices,
+                    lambda bf16: (
+                        not get_indexer_topk(topk_backend).takes_bf16_logits(
+                            bf16, topk_tokens, bf16.shape[0]
+                        )
+                    ),
+                )
+            if logits is None:
+                if localized is not None:
+                    # The builder skipped the full-device schedule.
+                    decode_metadata.schedule_metadata = get_paged_mqa_logits_metadata(
+                        seq_lens,
+                        kv_cache.shape[1],
+                        decode_metadata.schedule_metadata.shape[0] - 1,
+                        indices=decode_metadata.indices,
+                    )
+                logits = fp8_fp4_paged_mqa_logits(
+                    q,
+                    kv_cache,
+                    decode_weights,
+                    seq_lens,
+                    decode_metadata.block_table,
+                    decode_metadata.schedule_metadata,
+                    max_model_len=max_model_len,
+                    logits_dtype=logits_dtype,
+                    indices=decode_metadata.indices,
+                )
             # Keeping bf16 halves top-k/candidate reads. SM100 decode is varlen:
             # one context length per row.
             if dcp_world_size != 1 or not get_indexer_topk(

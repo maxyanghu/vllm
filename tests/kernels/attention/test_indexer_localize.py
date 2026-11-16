@@ -1,0 +1,577 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Die-local sparse-attention indexer decode (`VLLM_INDEXER_LOCALIZE`).
+
+The merge, join and build kernel tests run on CUDA GPUs (the build kernel's
+reference also needs DeepGEMM). The placement and scan tests need a GPU with
+two memory locality domains, DeepGEMM and `torch.cuda.execute_on_streams`.
+"""
+
+import math
+
+import pytest
+import torch
+
+from vllm.platforms import current_platform
+
+if not current_platform.is_cuda():
+    pytest.skip("CUDA only", allow_module_level=True)
+
+from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config  # noqa: E402
+from vllm.model_executor.layers.indexer_topk import get_indexer_topk  # noqa: E402
+from vllm.model_executor.layers.sparse_attn_indexer import (  # noqa: E402
+    as_fp32_logits,
+    kv_cache_as_quant_view,
+)
+from vllm.utils.import_utils import has_deep_gemm  # noqa: E402
+from vllm.v1.attention.ops.indexer_localize import build, placement, scan  # noqa: E402
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor  # noqa: E402
+
+UNIT_UE8M0_X4 = 0x7F7F7F7F
+
+
+def _device() -> torch.device:
+    return torch.device("cuda", torch.accelerator.current_device_index())
+
+
+def _resources(num_sms: int | None = None) -> placement.DomainResources:
+    """Resources for kernels that only need the domains' SM counts."""
+    device = _device()
+    total = torch.cuda.get_device_properties(device).multi_processor_count
+    half = num_sms or total // 2
+    return placement.DomainResources(device.index, [], [half, half], total, [])
+
+
+@pytest.fixture(scope="module")
+def domains() -> placement.DomainResources | None:
+    if not has_deep_gemm():
+        pytest.skip("needs DeepGEMM")
+    torch.empty(1, device=_device())  # the green contexts need a CUDA context
+    res = placement.get_domain_resources(_device())
+    if res is None:
+        pytest.skip("needs a GPU with two memory locality domains")
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    init_workspace_manager(_device())
+    return res
+
+
+def _row_pages(rows: int, pages: int, page_rows: int, gen: torch.Generator):
+    """Each row's pages split between the domains: the local-to-row page maps
+    and the join map ((local column << 1) | domain per row page)."""
+    device = _device()
+    order = torch.argsort(torch.rand(rows, 2 * pages, generator=gen, device=device))
+    inv = [order[:, :pages].int().contiguous(), order[:, pages:].int().contiguous()]
+    jmap = torch.empty(rows, 2 * pages, dtype=torch.int32, device=device)
+    local = torch.arange(pages, dtype=torch.int32, device=device).expand(rows, -1)
+    for d in range(2):
+        jmap.scatter_(1, inv[d].long(), local * page_rows * 2 + d)
+    return inv, jmap
+
+
+# ---------------------------------------------------------------------------
+# Kernels
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("page_rows", [64, 128])
+@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_merge_kernel_matches_triton_merge(topk, score_dtype, page_rows):
+    """The CUDA merge keeps the same token positions as the Triton merge: the
+    K largest of both domains' candidates, ties in candidate order."""
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(topk + page_rows)
+    rows, pages = 8, 4 * topk // page_rows
+    width = pages * page_rows
+    inv, jmap = _row_pages(rows, pages, page_rows, gen)
+    # Few distinct scores, so the K-th largest is tied.
+    scores = [
+        (torch.randint(-64, 64, (rows, width), generator=gen, device=device) / 8).to(
+            score_dtype
+        )
+        for _ in range(2)
+    ]
+    idx = []
+    for d in range(2):
+        cols = torch.rand(rows, width, generator=gen, device=device).argsort(dim=1)
+        cols = cols[:, :topk].int()
+        # Short rows have fewer than K candidates.
+        cols[d, topk // 3 :] = -1
+        idx.append(cols.contiguous())
+    loc = build.LocalizedDecodeMetadata(
+        page_rows=page_rows,
+        capacity=rows,
+        block_tables=[],
+        seq_lens=[],
+        schedules=[],
+        join_map=jmap,
+        inv_maps=inv,
+        page_stride=0,
+        resources=_resources(),
+    )
+    assert scan._merge_kernel(
+        topk, score_dtype == torch.float32, page_rows, device.index
+    ), "the CUDA merge does not build"
+    out = torch.full((rows, topk), -7, dtype=torch.int32, device=device)
+    scan.merge_candidates(loc, scores[0], scores[1], idx, topk, out)
+    ref = torch.full_like(out, -7)
+    scan._merge_topk_kernel[(rows,)](
+        scores[0],
+        scores[1],
+        width,
+        idx[0],
+        idx[1],
+        topk,
+        inv[0],
+        inv[1],
+        pages,
+        ref,
+        topk,
+        K=topk,
+        R=page_rows,
+        KEY32=score_dtype == torch.float32,
+    )
+    torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+    # The kept scores are the K largest candidate scores.
+    full = torch.full((rows, 2 * width), -math.inf, device=device)
+    for d in range(2):
+        valid = idx[d] >= 0
+        cols = idx[d].clamp(min=0).long()
+        page = inv[d].long().gather(1, cols // page_rows)
+        pos = page * page_rows + cols % page_rows
+        vals = scores[d].float().gather(1, cols)
+        full.scatter_(
+            1, torch.where(valid, pos, 0), torch.where(valid, vals, -math.inf)
+        )
+    expected = full.sort(dim=1, descending=True).values[:, :topk]
+    kept = torch.where(out >= 0, full.gather(1, out.clamp(min=0).long()), -math.inf)
+    torch.testing.assert_close(kept.sort(dim=1, descending=True).values, expected)
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("page_rows", [64, 128])
+def test_join_matches_reference(page_rows, out_dtype):
+    """Both domains' compact scores land at their row positions bit for bit,
+    with the 16-byte kernel and with its element-wise fallback; columns at or
+    past a row's length stay unwritten."""
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(page_rows)
+    rows, pages = 6, 40
+    width = 2 * pages * page_rows
+    stride = math.ceil(width / 1536) * 1536  # DeepGEMM's row alignment
+    inv, jmap = _row_pages(rows, pages, page_rows, gen)
+    compact = [
+        torch.randn(rows, stride, generator=gen, device=device).to(torch.bfloat16)[
+            :, :width
+        ]
+        for _ in range(2)
+    ]
+    lens = torch.tensor(
+        [0, 1, page_rows, 7 * page_rows + 5, width - 3, width],
+        dtype=torch.int32,
+        device=device,
+    )
+    loc = build.LocalizedDecodeMetadata(
+        page_rows=page_rows,
+        capacity=rows,
+        block_tables=[],
+        seq_lens=[],
+        schedules=[],
+        join_map=jmap,
+        inv_maps=inv,
+        page_stride=0,
+        resources=_resources(),
+    )
+    ref = torch.full((rows, width), -9.0, dtype=out_dtype, device=device)
+    for r in range(rows):
+        for d in range(2):
+            for lp, p in enumerate(inv[d][r].tolist()):
+                lo, hi = p * page_rows, min((p + 1) * page_rows, int(lens[r]))
+                if lo < hi:
+                    src = compact[d][r, lp * page_rows : lp * page_rows + hi - lo]
+                    ref[r, lo:hi] = src.to(out_dtype)
+    for out_stride in (stride, width + 1):  # the 16-byte path, the fallback
+        out = torch.full((rows, out_stride), -9.0, dtype=out_dtype, device=device)
+        out = out[:, :width]
+        scan.localized_join_scores(loc, compact[0], compact[1], out, lens)
+        assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("domain_plan", [True, False])
+def test_build_kernel_matches_reference(domain_plan):
+    """The one-launch build writes what the Triton split and DeepGEMM's
+    schedules write, including in a CUDA graph replayed over new inputs."""
+    if not (has_deep_gemm() and current_platform.is_device_capability_family(100)):
+        pytest.skip("needs DeepGEMM's SM100 paged MQA logits schedule")
+    device = _device()
+    gen = torch.Generator(device=device).manual_seed(int(domain_plan))
+    cap, rows, width, page_rows, num_pages = 24, 19, 2300, 64, 40000
+    pages = torch.arange(num_pages, device=device)
+    if domain_plan:
+        q0, k = 11, 37
+        dom = (((q0 + pages) // k) % 2).to(torch.int8)
+    else:
+        q0, k = 0, 0
+        dom = torch.randint(0, 2, (num_pages,), generator=gen, device=device)
+        dom = dom.to(torch.int8)
+    sms = _resources(num_sms=100).sms
+
+    def int32(*shape: int) -> torch.Tensor:
+        return torch.randint(
+            0, 1 << 20, shape, generator=gen, device=device, dtype=torch.int32
+        )
+
+    def inputs():
+        bt = torch.randint(
+            1, num_pages, (rows, width), generator=gen, device=device
+        ).int()
+        lens = torch.randint(
+            0, width * page_rows + 1, (rows,), generator=gen, device=device
+        ).int()
+        lens[:3] = torch.tensor([0, 1, width * page_rows], dtype=torch.int32)
+        return bt, lens
+
+    bt, lens = inputs()
+    indices = torch.arange(rows, dtype=torch.int32, device=device)
+    # Both builds start from the same junk, so unwritten entries compare too.
+    junk = dict(
+        bt=[int32(cap, width) for _ in range(2)],
+        lens=[int32(cap, 1) for _ in range(2)],
+        inv=[int32(cap, width) for _ in range(2)],
+        sched=[int32(s + 1, 2) for s in sms],
+        jmap=int32(cap, width),
+    )
+    ref = {n: [t.clone() for t in v] if isinstance(v, list) else v.clone()
+           for n, v in junk.items()}  # fmt: skip
+    ref["cnt"] = torch.zeros(cap, math.ceil(width / 512), dtype=torch.int32).to(device)
+    out = {n: [t.clone() for t in v] if isinstance(v, list) else v.clone()
+           for n, v in junk.items()}  # fmt: skip
+    args = build._GroupArgs(
+        bt=bt,
+        lens=lens,
+        dom=dom,
+        indices=indices,
+        lbt=out["bt"],
+        inv=out["inv"],
+        jmap=out["jmap"],
+        llen=out["lens"],
+        sched=out["sched"],
+        flags=torch.zeros(cap * 3, dtype=torch.int64, device=device),
+        state=torch.zeros(4, dtype=torch.int32, device=device),
+        R=page_rows,
+        width=width,
+        cap=cap,
+        num_rows=rows,
+        dom_q0=q0,
+        dom_k=k,
+    )
+    kernel = build._build_kernel(device.index)
+    assert kernel is not None
+
+    def check() -> None:
+        build.reference_build(bt, lens, indices, rows, dom, page_rows, sms, ref)
+        for name in junk:
+            assert (
+                all(torch.equal(a, b) for a, b in zip(ref[name], out[name]))
+                if (isinstance(ref[name], list))
+                else torch.equal(ref[name], out[name])
+            ), name
+
+    kernel.launch([args], sms)
+    check()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        kernel.launch([args], sms)
+    for _ in range(3):
+        new_bt, new_lens = inputs()
+        bt.copy_(new_bt)
+        lens.copy_(new_lens)
+        graph.replay()
+        check()
+
+
+# ---------------------------------------------------------------------------
+# Placement and the die-split decode (two locality domains)
+# ---------------------------------------------------------------------------
+def _cache_config(num_blocks: int, page_bytes: int, layers: int) -> KVCacheConfig:
+    """A block-outermost KV cache: block b holds every layer's page b."""
+    block_bytes = math.ceil(layers * page_bytes / 512) * 512
+    tensor = KVCacheTensor(
+        size=num_blocks * block_bytes,
+        layers=[f"layers.{i}.indexer.k_cache" for i in range(layers)],
+        layer_stride=page_bytes,
+        block_stride=block_bytes,
+    )
+    return KVCacheConfig(num_blocks, [tensor], [])
+
+
+@pytest.mark.parametrize("extensible", [False, True])
+def test_kv_cache_granules_live_in_their_planned_domain(domains, extensible):
+    """Every committed granule of the KV cache is in the locality domain of
+    its midpoint's run, and the page-to-domain table follows the plan."""
+    from cuda.bindings import driver as cu
+
+    from vllm.utils.extensible_tensor import granule_size
+    from vllm.v1.kv_cache_layout import KVCacheLayout
+    from vllm.v1.worker.extensible_kv_cache import ExtensibleKVCache
+
+    device = _device()
+    page_rows, row_bytes = 64, 132
+    config = _cache_config(6000, page_rows * row_bytes, 4)
+    size = config.kv_cache_tensors[0].size
+    kv_cache = None
+    allocate = None
+    if extensible:
+        kv_cache = ExtensibleKVCache(config, device, KVCacheLayout.BLHNC)
+        allocate = kv_cache.allocate
+    allocate = placement.localized_kv_allocate(config, device, allocate)
+    assert allocate is not None
+    buf = allocate(size)
+    if kv_cache is not None:
+        kv_cache.commit(config.num_blocks)
+    found = placement.find_buffer(buf.data_ptr())
+    assert found is not None
+    base, _, run_bytes = found
+    block_bytes = config.kv_cache_tensors[0].block_stride
+    assert run_bytes % block_bytes == 0
+
+    granule = granule_size(device.index)
+    for g in range(size // granule):
+        handle = cu.cuMemRetainAllocationHandle(base + g * granule + granule // 2)[1]
+        prop = cu.cuMemGetAllocationPropertiesFromHandle(handle)[1]
+        cu.cuMemRelease(handle)
+        assert (
+            prop.location.type
+            == cu.CUmemLocationType.CU_MEM_LOCATION_TYPE_DEVICE_LOCALITY_DOMAIN
+        )
+        planned = ((g * granule + granule // 2) // run_bytes) % 2
+        assert prop.location.localized.localityDomainId == planned, g
+
+    view = torch.as_strided(
+        buf.view(torch.uint8),
+        (config.num_blocks, page_rows, row_bytes),
+        (block_bytes, row_bytes, 1),
+        storage_offset=page_rows * row_bytes,
+    )
+    table = placement.page_domain_table(view)
+    assert table is not None
+    mid = view.data_ptr() - base + torch.arange(config.num_blocks) * block_bytes
+    mid += page_rows * row_bytes // 2
+    assert torch.equal(table.cpu(), ((mid // run_bytes) % 2).to(torch.int8))
+    q0, k = placement.page_domain_plan(view, table)
+    pages = torch.arange(config.num_blocks, device=device)
+    assert k > 0 and torch.equal((((q0 + pages) // k) % 2).to(torch.int8), table)
+
+
+def _fill_index_cache(kv: torch.Tensor, key_bytes: int, gen: torch.Generator):
+    """Random valid index keys (FP8 without NaN codes, or any MXFP4 byte)
+    with unit UE8M0 scales."""
+    pages, page_rows, row_bytes = kv.shape
+    flat = torch.as_strided(kv, (pages, page_rows * row_bytes), (kv.stride(0), 1))
+    data = torch.randint(
+        0,
+        256,
+        (pages, page_rows * row_bytes),
+        dtype=torch.uint8,
+        generator=gen,
+        device=kv.device,
+    )
+    if key_bytes == 128:  # FP8: no NaN
+        data.masked_fill_((data & 0x7F) == 0x7F, 0)
+    data[:, page_rows * key_bytes :] = 0x7F
+    flat.copy_(data)
+
+
+class _DecodeCase:
+    """A localized index-K cache and one decode batch over it, with the
+    stock (single-launch) scan for comparison."""
+
+    def __init__(self, fp4: bool, page_rows: int, rows: int, context: int):
+        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
+        from vllm.utils.deep_gemm import (
+            fp8_fp4_paged_mqa_logits,
+            get_num_sms,
+            get_paged_mqa_logits_metadata,
+            mqa_logits_mx_inputs,
+        )
+
+        device = _device()
+        gen = torch.Generator(device=device).manual_seed(rows + page_rows)
+        heads, dim = 32, 128
+        key_bytes = dim // 2 if fp4 else dim
+        row_bytes = key_bytes + 4
+        pages = math.ceil(context / page_rows)
+        self.max_model_len = 2 * context
+        self.width = math.ceil(self.max_model_len / page_rows)
+        num_blocks = rows * pages + 2
+        config = _cache_config(num_blocks, page_rows * row_bytes, 4)
+        allocate = placement.localized_kv_allocate(config, device, None)
+        assert allocate is not None
+        self.buffer = allocate(config.kv_cache_tensors[0].size)
+        block_bytes = config.kv_cache_tensors[0].block_stride
+        kv = torch.as_strided(
+            self.buffer.view(torch.uint8),
+            (num_blocks, page_rows, row_bytes),
+            (block_bytes, row_bytes, 1),
+            storage_offset=page_rows * row_bytes,
+        )
+        _fill_index_cache(kv, key_bytes, gen)
+        self.kv = kv_cache_as_quant_view(kv, dim, fp4)
+        vllm_config = VllmConfig()
+        with set_current_vllm_config(vllm_config):
+            cache = DeepseekV32IndexerCache(
+                row_bytes, torch.uint8, "layers.1.indexer.k_cache", CacheConfig()
+            )
+        cache.bind_kv_cache(kv.unsqueeze(1))
+        blocks = torch.randperm(num_blocks - 1, generator=gen, device=device) + 1
+        self.block_table = torch.zeros(
+            rows, self.width, dtype=torch.int32, device=device
+        )
+        self.block_table[:, :pages] = blocks[: rows * pages].view(rows, pages).int()
+        self.seq_lens = torch.randint(
+            context // 2, context + 1, (rows, 1), generator=gen, device=device
+        ).int()
+        self.indices = torch.arange(rows, dtype=torch.int32, device=device)
+        self.localizer = build.IndexerDecodeLocalizer(
+            [cache.prefix],
+            vllm_config.compilation_config.static_forward_context,
+            device,
+            rows,
+            self.width,
+            page_rows,
+        )
+        if fp4:
+            self.q_values = torch.randint(
+                -128, 128, (rows, 1, heads, dim // 2), dtype=torch.int8, device=device
+            )
+            q_scale = torch.full(
+                (rows, 1, heads), UNIT_UE8M0_X4, dtype=torch.int32, device=device
+            )
+        else:
+            self.q_values = torch.randn(rows, 1, heads, dim, device=device).to(
+                torch.float8_e4m3fn
+            )
+            q_scale = None
+        self.logits_dtype = torch.bfloat16 if fp4 else torch.float32
+        self.q_scale, self.weights = mqa_logits_mx_inputs(
+            self.q_values,
+            q_scale,
+            torch.randn(rows, heads, device=device) * 0.05,
+            self.logits_dtype,
+        )
+        schedule = get_paged_mqa_logits_metadata(
+            self.seq_lens, page_rows, get_num_sms(), indices=self.indices
+        )
+        self.stock = lambda: fp8_fp4_paged_mqa_logits(
+            (self.q_values, self.q_scale),
+            self.kv,
+            self.weights,
+            self.seq_lens,
+            self.block_table,
+            schedule,
+            self.max_model_len,
+            logits_dtype=self.logits_dtype,
+            indices=self.indices,
+        )
+
+    @property
+    def q(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self.q_values, self.q_scale
+
+
+def _assert_same_scores(out: torch.Tensor, ref: torch.Tensor, lens: torch.Tensor):
+    assert out.shape == ref.shape and out.stride() == ref.stride()
+    assert out.dtype == ref.dtype
+    bits = torch.int32 if ref.dtype == torch.float32 else torch.int16
+    for r, n in enumerate(lens.view(-1).tolist()):
+        assert torch.equal(out[r, :n].view(bits), ref[r, :n].view(bits)), r
+
+
+def _assert_same_kept_scores(
+    kept: torch.Tensor, ref: torch.Tensor, scores: torch.Tensor
+) -> None:
+    """Same selected score multiset per row (ties may pick other tokens)."""
+
+    def values(idx: torch.Tensor) -> torch.Tensor:
+        v = scores.float().gather(1, idx.clamp(min=0).long())
+        return torch.where(idx >= 0, v, -math.inf).sort(dim=1).values
+
+    assert torch.equal((kept >= 0).sum(1), (ref >= 0).sum(1))
+    assert torch.equal(values(kept), values(ref))
+
+
+@pytest.mark.parametrize(
+    "fp4,page_rows,topk",
+    [(False, 64, 2048), (True, 64, 512), (True, 128, 512)],
+    ids=["kimi_k3", "deepseek_v4_c2", "deepseek_v4_c1"],
+)
+def test_localized_decode_matches_single_launch(domains, fp4, page_rows, topk):
+    """The die-split scan and join return the single-launch scores bit for
+    bit; the per-domain top-k and merge keep the stock top-k's scores, also
+    inside a CUDA graph replayed over new queries."""
+    case = _DecodeCase(fp4, page_rows, rows=4, context=96 * 1024)
+    rows = case.seq_lens.shape[0]
+    meta = case.localizer.build(case.block_table, case.seq_lens, case.indices, rows)
+    assert meta is not None, "the localizer refused the batch"
+    ref = case.stock()
+    for want_fp32 in (False, True):
+
+        def upcast(scores: torch.Tensor, fp32: bool = want_fp32) -> bool:
+            return fp32
+
+        out = scan.localized_paged_mqa_logits(
+            meta,
+            case.q,
+            case.kv,
+            case.weights,
+            case.seq_lens,
+            case.max_model_len,
+            case.logits_dtype,
+            case.indices,
+            upcast,
+        )
+        assert out is not None
+        expected = as_fp32_logits(ref, case.seq_lens.view(-1)) if want_fp32 else ref
+        _assert_same_scores(out, expected, case.seq_lens)
+
+    selector = get_indexer_topk("auto")
+    max_seq_len = int(case.seq_lens.max())
+    assert scan.localized_topk_supported(selector, rows, case.max_model_len, topk)
+
+    def stock_topk() -> tuple[torch.Tensor, torch.Tensor]:
+        scores = case.stock()
+        kept = torch.full((rows, topk), -1, dtype=torch.int32, device=scores.device)
+        selector(scores, case.seq_lens, 1, kept, topk, max_seq_len)
+        return kept, scores
+
+    kept = torch.full((rows, topk), -7, dtype=torch.int32, device=ref.device)
+
+    def localized_topk() -> bool:
+        return scan.localized_paged_mqa_topk(
+            meta,
+            case.q,
+            case.kv,
+            case.weights,
+            case.max_model_len,
+            case.logits_dtype,
+            case.indices,
+            topk,
+            max_seq_len,
+            kept,
+        )
+
+    assert localized_topk()
+    _assert_same_kept_scores(kept, *stock_topk())
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        assert localized_topk()
+    for _ in range(2):
+        case.q_values.copy_(
+            torch.randn_like(case.q_values, dtype=torch.float32).to(case.q_values.dtype)
+            if not fp4
+            else torch.randint_like(case.q_values, -128, 128)
+        )
+        kept.fill_(-7)
+        graph.replay()
+        _assert_same_kept_scores(kept, *stock_topk())

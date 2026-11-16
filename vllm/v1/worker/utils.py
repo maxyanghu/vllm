@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -615,6 +616,13 @@ def allocate_kv_cache(
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1, "KV cache tensors must share one backing allocation."
     raw_size = sizes.pop()
+    if envs.VLLM_INDEXER_LOCALIZE:
+        # Place the KV cache by locality domain for the die-local indexer.
+        from vllm.v1.attention.ops.indexer_localize.placement import (
+            localized_kv_allocate,
+        )
+
+        allocate = localized_kv_allocate(kv_cache_config, device, allocate)
     if allocate is not None:
         buf = allocate(raw_size)
     else:
