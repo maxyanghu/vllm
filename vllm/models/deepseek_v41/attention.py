@@ -564,6 +564,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             and self.indexer is not None
             and not self.use_pcp
             and not vllm_config.parallel_config.use_ubatching
+            and vllm_config.speculative_config is None
             and aux_stream_list is not None
             and len(aux_stream_list) >= 2
         )

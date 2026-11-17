@@ -161,12 +161,13 @@ class _Candidates:
 _candidates = _Candidates()
 
 
-def init_candidate_stream(use_ubatching: bool) -> None:
-    """Create the candidate stream (at model construction). Not with
-    micro-batching: the deferred candidate state is one per process."""
+def init_candidate_stream(allowed: bool) -> None:
+    """Create the candidate stream (at model construction) when `allowed`:
+    not with micro-batching, whose threads would share the one deferred
+    candidate state, nor with speculative decoding."""
     if (
         envs.VLLM_INDEXER_OVERLAP
-        and not use_ubatching
+        and allowed
         and _candidates.stream is None
         and torch.cuda.is_available()
     ):

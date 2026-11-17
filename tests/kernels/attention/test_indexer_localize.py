@@ -609,7 +609,7 @@ def test_candidate_source_matches_stock(domains, monkeypatch):
     )
 
     monkeypatch.setenv("VLLM_INDEXER_OVERLAP", "1")
-    indexer_overlap.init_candidate_stream(use_ubatching=False)
+    indexer_overlap.init_candidate_stream(allowed=True)
     topk, block_size, topk_blocks, sparse_block_kv = 512, 8, 2048, 8
     case = _DecodeCase(True, 128, rows=4, context=96 * 1024)
     rows = case.seq_lens.shape[0]

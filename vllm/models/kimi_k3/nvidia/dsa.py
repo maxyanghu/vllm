@@ -701,7 +701,8 @@ class KimiK3DSAAttention(nn.Module):
             prefix,
             shardq_eligible=True,
             defer_indexer_topk=envs.VLLM_INDEXER_OVERLAP
-            and not vllm_config.parallel_config.use_ubatching,
+            and not vllm_config.parallel_config.use_ubatching
+            and vllm_config.speculative_config is None,
         )
 
         # Dense-MHA prefills never read the top-k indices (PCP excluded, as
