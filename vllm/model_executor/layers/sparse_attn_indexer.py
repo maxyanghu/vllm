@@ -510,6 +510,13 @@ def _varlen_decode_rows(
     )
 
 
+def _decode_candidate_score_dtype(topk_backend: str) -> torch.dtype | None:
+    """The candidate selection's score dtype on decode rows."""
+    return (
+        torch.float32 if topk_backend in ("auto", "cooperative", "persistent") else None
+    )
+
+
 def _localized_candidate_source_topk(
     attn_metadata_narrowed: DeepseekV32IndexerMetadata,
     q: tuple[torch.Tensor, torch.Tensor | None],
@@ -590,11 +597,7 @@ def _localized_candidate_source_topk(
             candidate_block_size,
             decode_candidates,
             1,
-            score_dtype=(
-                torch.float32
-                if topk_backend in ("auto", "cooperative", "persistent")
-                else None
-            ),
+            score_dtype=_decode_candidate_score_dtype(topk_backend),
         )
         indexer_overlap.expand_sparse_decode_rows(
             attn_metadata_narrowed, candidate_blocks, candidate_block_size
@@ -1374,8 +1377,10 @@ def sparse_attn_indexer(
                     ),
                 )
             if logits is None:
-                if localized is not None:
-                    # The builder skipped the full-device schedule.
+                if localized is not None and not decode_metadata.stock_schedule_built:
+                    # The builder skipped the full-device schedule: build it
+                    # once per step for the layers that fall back.
+                    decode_metadata.stock_schedule_built = True
                     decode_metadata.schedule_metadata = get_paged_mqa_logits_metadata(
                         seq_lens,
                         kv_cache.shape[1],
@@ -1429,11 +1434,7 @@ def sparse_attn_indexer(
                         candidate_block_size,
                         decode_candidates,
                         row_repeat,
-                        score_dtype=(
-                            torch.float32
-                            if topk_backend in ("auto", "cooperative", "persistent")
-                            else None
-                        ),
+                        score_dtype=_decode_candidate_score_dtype(topk_backend),
                     )
                     indexer_overlap.expand_sparse_decode_rows(
                         attn_metadata_narrowed, candidate_blocks, candidate_block_size
@@ -1449,11 +1450,7 @@ def sparse_attn_indexer(
                     candidate_block_size,
                     decode_candidates,
                     row_repeat,
-                    score_dtype=(
-                        torch.float32
-                        if topk_backend in ("auto", "cooperative", "persistent")
-                        else None
-                    ),
+                    score_dtype=_decode_candidate_score_dtype(topk_backend),
                 )
             else:
                 indexer_overlap.join_candidates()
@@ -1605,14 +1602,14 @@ class SparseAttnIndexer(CustomOp):
         self.candidate_blocks = candidate_blocks
         self.candidate_block_size = candidate_block_size
         self.candidate_write = candidate_write
-        if candidate_write:
-            indexer_overlap.init_candidate_stream()
         self.dense_mha_metadata_layer_name = ""
         # DCP scalars are constant for the run; resolve them here (config is set
         # during model construction) and pass them into the custom op, rather
         # than threading them through per-step metadata.
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
+        if candidate_write:
+            indexer_overlap.init_candidate_stream(parallel_config.use_ubatching)
         self.topk_backend = vllm_config.kernel_config.sparse_indexer_topk_backend
         get_indexer_topk(self.topk_backend)
         self.logits_dtype = STR_DTYPE_TO_TORCH_DTYPE[

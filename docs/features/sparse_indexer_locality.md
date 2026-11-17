@@ -26,8 +26,9 @@ bandwidth. With `VLLM_INDEXER_LOCALIZE=1`:
   and to the plain allocation.
 - Every decode step, one kernel (captured in the decode CUDA graph) splits each
   request's index-key pages by domain and builds both domains' DeepGEMM
-  schedules. The first build of each indexer cache group is checked against a
-  reference build, bit for bit.
+  schedules. The first eager build of each indexer cache group, for at most 32
+  rows and for more, is checked against a reference build, bit for bit; a batch
+  size captured before its check runs the stock indexer.
 - Each domain's SMs (a green context per domain) scan the pages in their own
   memory with DeepGEMM's `fp8_fp4_paged_mqa_logits`. For batches of at most 64
   rows with top-k 512, 1024 or 2048, each domain also runs the top-k on its own
@@ -43,8 +44,10 @@ Requirements: a GPU with two locality domains, DeepGEMM, `cuda-bindings` 13.4 or
 later (driver API and NVRTC), and a PyTorch build with locality-domain green
 contexts and `torch.cuda.execute_on_streams` (nightly from 2026-10-08, 2.16).
 Where any of these is missing, vLLM logs why and runs the stock indexer. The die
-split is also off with speculative decoding, decode or prefill context
-parallelism, a KV connector, and for other models.
+split and the KV cache placement are also off for models other than
+`KimiK31ForConditionalGeneration` and `DeepseekV41ForCausalLM`, with speculative
+decoding, decode or prefill context parallelism, a KV connector, and with the
+CuMem allocator on a plain (non-extensible) KV cache.
 
 When active, each rank logs `KV cache placed in ... runs alternating between 2
 locality domains` and, once per indexer cache group, `Die-local sparse indexer
@@ -70,4 +73,6 @@ order.
   joins the two score arrays as part of the deferred candidate work.
 
 The overlap works with and without `VLLM_INDEXER_LOCALIZE`. It is off with
-micro-batching (`--enable-dbo` or `--ubatch-size`).
+micro-batching (`--enable-dbo` or `--ubatch-size`), and for Kimi K3.1 with an
+attention backend whose top-k conversion does not go through the shared sparse
+MLA index group.

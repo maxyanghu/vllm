@@ -453,7 +453,10 @@ static __device__ void split_block(const Group& G, int item, int* s_warp,
       n1, s_warp, chunk_n1);  // its barriers also publish s_misc[4], s_misc[5]
   const u32 tag = (u32)s_misc[4];
   const u64* fl = G.flags + (i64)r * G.nch;
-  if (tid == 0)
+  // An empty row's block is not waited for, so it may read the epoch after
+  // the schedule block bumped it: it must not publish (its tag would be the
+  // next launch's).
+  if (tid == 0 && npages > 0)
     st_relaxed_u64(G.flags + (i64)r * G.nch + c,
                    ((u64)tag << 32) | (u64)(u32)chunk_n1);
   // Look-back: the sum of all earlier chunks' counts (they run concurrently, so

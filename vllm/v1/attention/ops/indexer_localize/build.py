@@ -31,12 +31,10 @@ from vllm.v1.attention.ops.indexer_localize.placement import (
     get_domain_resources,
     page_domain_plan,
     page_domain_table,
+    unsupported_config_reason,
 )
 
 logger = init_logger(__name__)
-
-# Architectures the die-local indexer is validated for.
-_ARCHITECTURES = ("KimiK3", "DeepseekV4")
 
 # Reference split: pages per Triton program.
 _CHUNK = 512
@@ -474,8 +472,9 @@ class IndexerDecodeLocalizer:
         self._dom_plan = (0, 0)
         self.page_stride = 0
         self._bufs: dict[str, Any] | None = None
-        # None: not checked yet; True: the kernel matched the reference.
-        self._checked: bool | None = None
+        # Per schedule path (warp for <= 32 rows, block otherwise): absent if
+        # not checked yet, True if the kernel matched the reference.
+        self._checked: dict[bool, bool] = {}
         self._args: dict[tuple, tuple] = {}
         self._warned = False
         if self.res is not None and _build_kernel(self.res.device) is None:
@@ -562,11 +561,11 @@ class IndexerDecodeLocalizer:
             dom = bufs["dom"]
             if dom is None or dom.numel() < table.numel():
                 if dom is not None:
-                    logger.warning(
-                        "Die-local indexer: the indexer cache grew from %d to %d "
-                        "pages after CUDA graph capture.",
-                        dom.numel(),
-                        table.numel(),
+                    # Captured builds keep the old table's address and size.
+                    raise RuntimeError(
+                        "Die-local indexer: the indexer cache grew from "
+                        f"{dom.numel()} to {table.numel()} pages after its "
+                        "page-to-domain table was first used."
                     )
                 dom = bufs["dom"] = torch.empty(
                     max(1, table.numel()), dtype=torch.int8, device=table.device
@@ -661,12 +660,15 @@ class IndexerDecodeLocalizer:
             )
             entry = self._args[key] = (args, meta)
         args, meta = entry
-        if self._checked is None:
+        path = num_rows <= 32
+        if path not in self._checked:
             if torch.cuda.is_current_stream_capturing():
                 return None
-            self._checked = self._self_check(args, block_table, lens, indices, bufs)
-            if not self._checked:
-                return None
+            self._checked[path] = self._self_check(
+                args, block_table, lens, indices, bufs
+            )
+        if not self._checked[path]:
+            return None
         pending = _PendingBuild(args)
         _PENDING.setdefault(self.res.device, {})[id(self)] = pending
         return replace(meta, pending=pending)
@@ -748,14 +750,9 @@ def maybe_make_decode_localizer(
     Called from the builder's constructor when `VLLM_INDEXER_LOCALIZE` is set.
     """
     vllm_config = builder.vllm_config
-    reason = None
-    archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
-    if vllm_config.speculative_config is not None:
-        reason = "speculative decoding"
-    elif builder.dcp_world_size > 1 or builder.use_pcp:
+    reason = unsupported_config_reason(vllm_config)
+    if reason is None and (builder.dcp_world_size > 1 or builder.use_pcp):
         reason = "decode or prefill context parallelism"
-    elif not any(a.startswith(_ARCHITECTURES) for a in archs):
-        reason = f"architecture {archs}"
     if reason is not None:
         logger.warning_once(
             "VLLM_INDEXER_LOCALIZE does not support %s; using the stock sparse "

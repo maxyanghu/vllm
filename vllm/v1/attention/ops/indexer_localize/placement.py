@@ -4,10 +4,10 @@
 
 The KV cache backing allocation (one buffer for every layer and cache group)
 is a VMM range whose physical chunks alternate between the two locality
-domains in runs of whole KV blocks close to 32 MiB: the domain of a byte
-offset is `(offset // run_bytes) % 2`, and each granule takes the domain of
-its midpoint. Block ids, slot mappings and cache-insert kernels are
-unchanged; the page-to-domain map is arithmetic on the page address.
+domains in runs close to 32 MiB (whole KV blocks, and whole VMM granules when
+both fit): each granule takes the domain `(midpoint // run_bytes) % 2`, and a
+page the domain of the granule holding its midpoint. Block ids, slot mappings
+and cache-insert kernels are unchanged.
 """
 
 import math
@@ -27,6 +27,26 @@ logger = init_logger(__name__)
 
 NUM_DOMAINS = 2
 _TARGET_RUN_BYTES = 32 << 20
+# Architectures the die-local indexer is validated for.
+ARCHITECTURES = ("KimiK31ForConditionalGeneration", "DeepseekV41ForCausalLM")
+
+
+def unsupported_config_reason(vllm_config: Any) -> str | None:
+    """Why this configuration cannot use the die-local indexer, or None."""
+    archs = getattr(vllm_config.model_config.hf_config, "architectures", None) or []
+    parallel = vllm_config.parallel_config
+    if not any(a in ARCHITECTURES for a in archs):
+        return f"architecture {archs}"
+    if vllm_config.speculative_config is not None:
+        return "speculative decoding"
+    if (
+        parallel.decode_context_parallel_size > 1
+        or parallel.prefill_context_parallel_size > 1
+    ):
+        return "decode or prefill context parallelism"
+    if vllm_config.kv_transfer_config is not None:
+        return "a KV connector registers or exports the KV cache"
+    return None
 
 
 @dataclass(frozen=True)
@@ -112,14 +132,15 @@ def get_domain_resources(device: torch.device | int) -> DomainResources | None:
 
 
 # Localized allocations: (base, end, run_bytes). The tensors own the memory.
-_BUFFERS: list[tuple[int, int, int]] = []
+# (base, end, run_bytes, granule) of each localized VMM range.
+_BUFFERS: list[tuple[int, int, int, int]] = []
 
 
 def _forget(base: int) -> None:
     _BUFFERS[:] = [buf for buf in _BUFFERS if buf[0] != base]
 
 
-def find_buffer(ptr: int) -> tuple[int, int, int] | None:
+def find_buffer(ptr: int) -> tuple[int, int, int, int] | None:
     """The localized allocation holding device address `ptr`, if any."""
     for buf in _BUFFERS:
         if buf[0] <= ptr < buf[1]:
@@ -127,10 +148,13 @@ def find_buffer(ptr: int) -> tuple[int, int, int] | None:
     return None
 
 
-def _run_bytes(bytes_per_block: int | None) -> int:
-    if not bytes_per_block:
-        return _TARGET_RUN_BYTES
-    return max(1, round(_TARGET_RUN_BYTES / bytes_per_block)) * bytes_per_block
+def _run_bytes(bytes_per_block: int | None, granule: int) -> int:
+    """A run close to 32 MiB of whole blocks and, when the two fit together,
+    whole granules (then every page's granule lies in its own run)."""
+    unit = math.lcm(bytes_per_block, granule) if bytes_per_block else granule
+    if unit > 4 * _TARGET_RUN_BYTES:
+        unit = bytes_per_block or granule
+    return max(1, round(_TARGET_RUN_BYTES / unit)) * unit
 
 
 def _block_bytes(kv_cache_config: Any) -> int | None:
@@ -206,7 +230,9 @@ def _place_virtual_buffer(vbuf: Any, run_bytes: int) -> None:
             g = stop
 
     vbuf._map_chunk_at = map_chunk_at
-    _BUFFERS.append((vbuf.base_ptr, vbuf.base_ptr + vbuf.reserved_size, run_bytes))
+    _BUFFERS.append(
+        (vbuf.base_ptr, vbuf.base_ptr + vbuf.reserved_size, run_bytes, granule)
+    )
     weakref.finalize(vbuf, _forget, vbuf.base_ptr)
     logger.info(
         "KV cache placed in %.1f MiB runs alternating between %d locality "
@@ -244,30 +270,48 @@ def localized_kv_allocate(
     tensors = kv_cache_config.kv_cache_tensors
     if device.type != "cuda" or not tensors or any(t.host_resident for t in tensors):
         return allocate
+    # The engine allocates under its config; without one (direct callers)
+    # only the device decides.
     config = get_current_vllm_config_or_none()
     reason = None
-    if config is not None and config.kv_transfer_config is not None:
-        reason = "a KV connector registers or exports the KV cache"
-    elif (
-        allocate is None
-        and config is not None
-        and config.model_config.enable_sleep_mode
-    ):
-        reason = "sleep mode manages the KV cache allocation"
+    if config is not None:
+        reason = unsupported_config_reason(config)
+        if (
+            reason is None
+            and allocate is None
+            and config.model_config.enable_cumem_allocator
+        ):
+            reason = "the CuMem allocator (sleep mode) manages the KV cache"
     if reason is not None:
         logger.warning(
-            "VLLM_INDEXER_LOCALIZE: %s; using the stock sparse indexer.", reason
+            "VLLM_INDEXER_LOCALIZE: %s; the KV cache keeps the stock placement "
+            "and the sparse indexer the stock path.",
+            reason,
         )
         return allocate
     if get_domain_resources(device) is None:
         return allocate
     if allocate is None:
-        run_bytes = _run_bytes(_block_bytes(kv_cache_config))
+        block_bytes = _block_bytes(kv_cache_config)
 
         def allocate_localized(size: int) -> torch.Tensor:
             buffer = ExtensibleTensor(size, device=device)
+            run_bytes = _run_bytes(block_bytes, buffer._buffer.granularity)
             _place_virtual_buffer(buffer._buffer, run_bytes)
-            buffer.resize_segments_([size], zero_new=True)
+            try:
+                buffer.resize_segments_([size], zero_new=True)
+            except RuntimeError as e:
+                # One domain can run out before the device does.
+                _forget(buffer._buffer.base_ptr)
+                del buffer
+                logger.warning(
+                    "VLLM_INDEXER_LOCALIZE: placing the KV cache by locality "
+                    "domain failed (%s); stock placement and indexer.",
+                    e,
+                )
+                from vllm.v1.worker.utils import _allocate_kv_cache_buffer
+
+                return _allocate_kv_cache_buffer(size, device)
             return torch.as_tensor(_Owner(buffer, size), device=device)
 
         return allocate_localized
@@ -285,7 +329,8 @@ def localized_kv_allocate(
         )
         return allocate
     run_bytes = _run_bytes(
-        getattr(owner, "bytes_per_block", None) or _block_bytes(kv_cache_config)
+        getattr(owner, "bytes_per_block", None) or _block_bytes(kv_cache_config),
+        vbuf.granularity,
     )
     _place_virtual_buffer(vbuf, run_bytes)
     return allocate
@@ -302,12 +347,14 @@ def page_domain_table(kv: torch.Tensor) -> torch.Tensor | None:
     buf = find_buffer(kv.data_ptr())
     if buf is None:
         return None
-    base, _, run_bytes = buf
+    base, _, run_bytes, granule = buf
     page_stride = kv.stride(0) * kv.element_size()
     page_bytes = math.prod(kv.shape[1:]) * kv.element_size()
     p = torch.arange(kv.shape[0], device=kv.device, dtype=torch.int64)
     mid = (kv.data_ptr() - base) + p * page_stride + page_bytes // 2
-    return ((mid // run_bytes) % NUM_DOMAINS).to(torch.int8)
+    # The domain the granule holding the page's midpoint was created in.
+    gmid = (mid // granule) * granule + granule // 2
+    return ((gmid // run_bytes) % NUM_DOMAINS).to(torch.int8)
 
 
 def page_domain_plan(kv: torch.Tensor, table: torch.Tensor) -> tuple[int, int]:
@@ -321,7 +368,7 @@ def page_domain_plan(kv: torch.Tensor, table: torch.Tensor) -> tuple[int, int]:
     buf = find_buffer(kv.data_ptr())
     if buf is None or kv.shape[0] != table.numel():
         return 0, 0
-    base, _, run_bytes = buf
+    base, _, run_bytes, _ = buf
     stride = kv.stride(0) * kv.element_size()
     page_bytes = math.prod(kv.shape[1:]) * kv.element_size()
     off = (kv.data_ptr() - base) + page_bytes // 2

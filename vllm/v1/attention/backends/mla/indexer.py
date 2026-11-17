@@ -714,8 +714,10 @@ class DeepSeekV32IndexerDecodeMetadata:
     write_max_decode_len: int = 0
     indices: torch.Tensor | None = None
     query_start_loc: torch.Tensor | None = None
-    # Per-locality-domain scan inputs (VLLM_INDEXER_LOCALIZE).
+    # Per-locality-domain scan inputs (VLLM_INDEXER_LOCALIZE), and whether a
+    # layer that fell back already built the full-device schedule.
     localized: "LocalizedDecodeMetadata | None" = None
+    stock_schedule_built: bool = False
 
 
 @dataclass

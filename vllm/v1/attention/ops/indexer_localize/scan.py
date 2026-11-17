@@ -660,8 +660,8 @@ def localized_paged_mqa_topk(
 
     `topk_out` is the `[rows, K]` int32 view of the top-k buffer. With
     `keep`, both domains' compact scores are appended to it (for a join the
-    caller runs later). When the caller requested a deferred top-k
-    (`indexer_overlap.request_deferred_topk`), the call returns without
+    caller runs later; such a call never defers). When the caller requested a
+    deferred top-k (`indexer_overlap.request_deferred_topk`), the call returns without
     joining: domain 0's stream waits for domain 1 and merges. Returns False,
     without launching anything, when this call cannot be localized.
     """
@@ -688,7 +688,7 @@ def localized_paged_mqa_topk(
         )
         return o
 
-    if indexer_overlap.consume_deferred_topk_request():
+    if keep is None and indexer_overlap.consume_deferred_topk_request():
         # Fork without joining: each domain stream waits for the caller's
         # work so far, scans and selects; domain 0 then waits for domain 1
         # and merges. The caller joins on domain 0's stream.

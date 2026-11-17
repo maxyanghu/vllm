@@ -51,6 +51,30 @@ def decode_only(metadata: Any) -> bool:
     )
 
 
+def index_group_joins_topk(impl: Any, metadata: Any, num_tokens: int) -> bool:
+    """Whether sparse attention reads the top-k only through its index group's
+    conversion, which waits for the top-k's ready event (`_convert_once`):
+    the shared sparse MLA `forward_mqa`, a non-HiSparse group, no DCP, no
+    token offset, a group that converts decode tokens, and a batch that fits
+    the group's buffer. Any other reader would not wait for a deferred top-k."""
+    from vllm.model_executor.layers.attention.sparse_mla_attention import (
+        SparseMLACommonImpl,
+    )
+    from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
+
+    group = getattr(impl, "index_group", None)
+    return (
+        isinstance(impl, SparseMLACommonImpl)
+        and type(impl).forward_mqa is SparseMLACommonImpl.forward_mqa
+        and group is not None
+        and not isinstance(group, HiSparseMLAIndexGroup)
+        and impl.dcp_world_size == 1
+        and not getattr(metadata, "topk_start", 0)
+        and not (impl.group_conversion_decode_only and group.num_layers <= 1)
+        and num_tokens <= group.physical_topk_indices.shape[0]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Deferred top-k
 # ---------------------------------------------------------------------------
@@ -137,10 +161,12 @@ class _Candidates:
 _candidates = _Candidates()
 
 
-def init_candidate_stream() -> None:
-    """Create the candidate stream (at model construction)."""
+def init_candidate_stream(use_ubatching: bool) -> None:
+    """Create the candidate stream (at model construction). Not with
+    micro-batching: the deferred candidate state is one per process."""
     if (
         envs.VLLM_INDEXER_OVERLAP
+        and not use_ubatching
         and _candidates.stream is None
         and torch.cuda.is_available()
     ):

@@ -198,15 +198,16 @@ def test_join_matches_reference(page_rows, out_dtype):
         assert torch.equal(out, ref)
 
 
+@pytest.mark.parametrize("rows", [19, 40])  # warp and block schedule paths
 @pytest.mark.parametrize("domain_plan", [True, False])
-def test_build_kernel_matches_reference(domain_plan):
+def test_build_kernel_matches_reference(domain_plan, rows):
     """The one-launch build writes what the Triton split and DeepGEMM's
     schedules write, including in a CUDA graph replayed over new inputs."""
     if not (has_deep_gemm() and current_platform.is_device_capability_family(100)):
         pytest.skip("needs DeepGEMM's SM100 paged MQA logits schedule")
     device = _device()
     gen = torch.Generator(device=device).manual_seed(int(domain_plan))
-    cap, rows, width, page_rows, num_pages = 24, 19, 2300, 64, 40000
+    cap, width, page_rows, num_pages = rows + 5, 2300, 64, 40000
     pages = torch.arange(num_pages, device=device)
     if domain_plan:
         q0, k = 11, 37
@@ -230,6 +231,9 @@ def test_build_kernel_matches_reference(domain_plan):
             0, width * page_rows + 1, (rows,), generator=gen, device=device
         ).int()
         lens[:3] = torch.tensor([0, 1, width * page_rows], dtype=torch.int32)
+        # Empty rows move between replays (padded decode rows).
+        empty = 3 + torch.randperm(rows - 3, generator=gen, device=device)
+        lens[empty[: rows // 4]] = 0
         return bt, lens
 
     bt, lens = inputs()
@@ -283,7 +287,7 @@ def test_build_kernel_matches_reference(domain_plan):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         kernel.launch([args], sms)
-    for _ in range(3):
+    for _ in range(20):
         new_bt, new_lens = inputs()
         bt.copy_(new_bt)
         lens.copy_(new_lens)
@@ -332,7 +336,7 @@ def test_kv_cache_granules_live_in_their_planned_domain(domains, extensible):
         kv_cache.commit(config.num_blocks)
     found = placement.find_buffer(buf.data_ptr())
     assert found is not None
-    base, _, run_bytes = found
+    base, _, run_bytes, _ = found
     block_bytes = config.kv_cache_tensors[0].block_stride
     assert run_bytes % block_bytes == 0
 
@@ -605,7 +609,7 @@ def test_candidate_source_matches_stock(domains, monkeypatch):
     )
 
     monkeypatch.setenv("VLLM_INDEXER_OVERLAP", "1")
-    indexer_overlap.init_candidate_stream()
+    indexer_overlap.init_candidate_stream(use_ubatching=False)
     topk, block_size, topk_blocks, sparse_block_kv = 512, 8, 2048, 8
     case = _DecodeCase(True, 128, rows=4, context=96 * 1024)
     rows = case.seq_lens.shape[0]

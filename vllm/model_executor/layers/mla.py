@@ -171,10 +171,11 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             )
         self.prefix = prefix
 
-    def _defer_topk(self) -> bool:
+    def _defer_topk(self, num_tokens: int) -> bool:
         """Whether this call may let the indexer's top-k land late: a sparse
-        layer with q-LoRA, no DCP query replication, and a FULL CUDA graph
-        capture of a pure decode batch."""
+        layer with q-LoRA, no DCP query replication, a FULL CUDA graph capture
+        of a pure decode batch, and an attention impl whose index group
+        conversion waits for the top-k (the only reader that joins it)."""
         if (
             not self.defer_indexer_topk
             or not self.is_sparse
@@ -185,8 +186,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         ):
             return False
         attn_metadata = get_forward_context().attn_metadata
-        return isinstance(attn_metadata, dict) and indexer_overlap.decode_only(
-            attn_metadata.get(self.mla_attn.layer_name)
+        if not isinstance(attn_metadata, dict):
+            return False
+        metadata = attn_metadata.get(self.mla_attn.layer_name)
+        return indexer_overlap.decode_only(
+            metadata
+        ) and indexer_overlap.index_group_joins_topk(
+            self.mla_attn.impl, metadata, num_tokens
         )
 
     def _forward_deferred_topk(
@@ -279,7 +285,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         llama_4_scaling: torch.Tensor | None = None,
         skip_o_proj: bool = False,
     ) -> torch.Tensor:
-        if self._defer_topk():
+        if self._defer_topk(hidden_states.shape[0]):
             return self._forward_deferred_topk(
                 positions, hidden_states, llama_4_scaling, skip_o_proj
             )
